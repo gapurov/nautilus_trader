@@ -627,6 +627,7 @@ mod tests {
         let (first, second) = tokio::join!(gate.admit_http(), gate.admit_http());
         let mut lease = None;
         let mut denied = 0;
+
         for decision in [first.unwrap(), second.unwrap()] {
             match decision {
                 AdmissionDecision::Admitted(admission_lease) => {

@@ -111,10 +111,12 @@ async fn controlled_account_rest_and_websocket_smoke() {
     let (ready, websocket_payload) = tokio::time::timeout(Duration::from_secs(30), async {
         let mut ready = false;
         let mut websocket_payload = None;
+
         while let Some(event) = receiver.recv().await {
             let DataEvent::Data(Data::Custom(custom)) = event else {
                 continue;
             };
+
             if let Some(state) = custom
                 .data
                 .as_any()
@@ -141,6 +143,7 @@ async fn controlled_account_rest_and_websocket_smoke() {
                     }
                 }
             }
+
             if ready && websocket_payload.is_some() {
                 return (ready, websocket_payload);
             }
