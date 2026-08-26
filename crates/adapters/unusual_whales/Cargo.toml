@@ -1,0 +1,104 @@
+[package]
+name = "nautilus-unusual-whales"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Unusual Whales informational data adapter for the Nautilus trading engine"
+categories.workspace = true
+keywords.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "nautilus_unusual_whales"
+crate-type = ["rlib"]
+
+[features]
+default = ["high-precision"]
+arrow = ["dep:arrow", "nautilus-serialization"]
+examples = ["nautilus-live/node"]
+extension-module = [
+  "nautilus-common/extension-module",
+  "nautilus-core/extension-module",
+  "nautilus-live/extension-module",
+  "nautilus-model/extension-module",
+  "nautilus-network/extension-module",
+  "pyo3/extension-module",
+  "python",
+]
+python = [
+  "dep:nautilus-system",
+  "nautilus-common/python",
+  "nautilus-core/python",
+  "nautilus-live/python",
+  "nautilus-model/python",
+  "nautilus-network/python",
+  "nautilus-system/python",
+  "pyo3",
+  "pyo3-stub-gen",
+]
+high-precision = [
+  "nautilus-model/high-precision",
+  "nautilus-serialization?/high-precision",
+]
+
+[package.metadata.cargo-machete]
+ignored = ["nautilus-live"] # Used only to propagate the optional examples and extension features
+
+[package.metadata.docs.rs]
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["arrow", "examples", "high-precision"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+nautilus-common = { workspace = true, features = ["live"] }
+nautilus-core = { workspace = true }
+nautilus-live = { workspace = true }
+nautilus-model = { workspace = true }
+nautilus-network = { workspace = true }
+nautilus-persistence-macros = { workspace = true }
+nautilus-serialization = { workspace = true, features = [
+  "arrow",
+], optional = true }
+nautilus-system = { workspace = true, optional = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+bon = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+redis = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+url = { workspace = true }
+ustr = { workspace = true }
+zeroize = { workspace = true }
+
+arrow = { workspace = true, optional = true }
+pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+
+[[test]]
+name = "python"
+path = "tests/python.rs"
+required-features = ["python"]

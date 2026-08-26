@@ -280,6 +280,11 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(submodule)?;
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
 
+    let n = "unusual_whales";
+    let submodule = pyo3::wrap_pymodule!(nautilus_unusual_whales::python::unusual_whales);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+
     #[cfg(feature = "defi")]
     {
         // nautilus-import-ok: wrap_pymodule! requires fully qualified paths

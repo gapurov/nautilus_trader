@@ -1,0 +1,11 @@
+{
+  "channel_form_count": 28,
+  "method_counts": {
+    "GET": 214,
+    "POST": 1
+  },
+  "operation_count": 215,
+  "path_count": 214,
+  "source_sha256": "38ca3116dcbcc941c002154c02dfde4c96e9c79a4d2462e73c768fb6a2f7d43f",
+  "source_url": "https://api.unusualwhales.com/api/openapi"
+}

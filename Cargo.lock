@@ -6902,6 +6902,7 @@ dependencies = [
  "nautilus-tardis",
  "nautilus-testkit",
  "nautilus-trading",
+ "nautilus-unusual-whales",
  "pyo3",
  "pyo3-stub-gen",
 ]
@@ -7155,6 +7156,45 @@ dependencies = [
  "nautilus-model",
  "nautilus-trading",
  "tokio",
+]
+
+[[package]]
+name = "nautilus-unusual-whales"
+version = "0.62.0"
+dependencies = [
+ "anyhow",
+ "arrow 58.4.0",
+ "async-trait",
+ "base64 0.23.1",
+ "blake3",
+ "bon",
+ "bytes",
+ "futures-util",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-persistence-macros",
+ "nautilus-serialization",
+ "nautilus-system",
+ "pyo3",
+ "pyo3-stub-gen",
+ "redis",
+ "regex",
+ "reqwest 0.13.4",
+ "rstest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
+ "url",
+ "ustr",
+ "zeroize",
 ]
 
 [[package]]

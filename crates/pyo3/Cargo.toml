@@ -27,6 +27,7 @@ arrow = [
   "nautilus-deribit/arrow",
   "nautilus-hyperliquid/arrow",
   "nautilus-serialization/arrow",
+  "nautilus-unusual-whales/arrow",
 ]
 betfair = ["dep:nautilus-betfair", "nautilus-betfair/python"]
 defi = [
@@ -69,6 +70,7 @@ extension-module = [
   "nautilus-risk/extension-module",
   "nautilus-serialization/extension-module",
   "nautilus-tardis/extension-module",
+  "nautilus-unusual-whales/extension-module",
   "nautilus-testkit/extension-module",
   "nautilus-trading/extension-module",
   "pyo3/extension-module",
@@ -93,6 +95,7 @@ high-precision = [
   "nautilus-polymarket/high-precision",
   "nautilus-sandbox/high-precision",
   "nautilus-tardis/high-precision",
+  "nautilus-unusual-whales/high-precision",
 ]
 hypersync = ["defi", "nautilus-blockchain/hypersync"]
 mimalloc = ["dep:mimalloc"]
@@ -156,6 +159,7 @@ nautilus-okx = { workspace = true, features = ["python"] }
 nautilus-polymarket = { workspace = true, features = ["python"] }
 nautilus-sandbox = { workspace = true, features = ["python"] }
 nautilus-tardis = { workspace = true, features = ["python", "replay"] }
+nautilus-unusual-whales = { workspace = true, features = ["python"] }
 
 pyo3 = { workspace = true }
 pyo3-stub-gen = { workspace = true }
