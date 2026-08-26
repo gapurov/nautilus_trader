@@ -2146,6 +2146,7 @@ mod tests {
         // Verify calculation: actual_balance = walletBalance - spotBorrow = 1200 - 200 = 1000
         let account_id = crate::common::parse::parse_account_state(
             wallet,
+            crate::common::enums::BybitMarginMode::RegularMargin,
             AccountId::new("BYBIT-001"),
             UnixNanos::default(),
         )
@@ -2153,6 +2154,16 @@ mod tests {
 
         let balance = &account_id.balances[0];
         assert_eq!(balance.total.as_f64(), 1000.0);
+        let info = account_id.info.as_ref().expect("account info missing");
+        assert_eq!(info["margin_mode"], "REGULAR_MARGIN");
+        assert_eq!(info["total_available_balance"], "2500.00");
+        assert_eq!(info["total_equity"], "3000.00");
+        assert_eq!(info["account_im_rate"], "0");
+        assert_eq!(info["account_mm_rate"], "0");
+        assert_eq!(info["coins"]["USDT"]["wallet_balance"], "1200.00");
+        assert_eq!(info["coins"]["USDT"]["equity"], "1000.00");
+        assert_eq!(info["coins"]["USDT"]["usd_value"], "1000.00");
+        assert_eq!(info["usdt_to_account_usd_rate"], "1");
     }
 
     #[rstest]
@@ -2171,6 +2182,7 @@ mod tests {
 
         let account_state = crate::common::parse::parse_account_state(
             wallet,
+            crate::common::enums::BybitMarginMode::RegularMargin,
             AccountId::new("BYBIT-001"),
             UnixNanos::default(),
         )

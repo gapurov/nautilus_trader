@@ -2022,6 +2022,9 @@ impl ExecutionEngine {
         };
 
         match command {
+            TradingCommand::SubmitOrder(cmd) if cmd.is_order_preview() => {
+                self.handle_order_preview(client, cmd);
+            }
             TradingCommand::SubmitOrder(cmd) => self.handle_submit_order(client, cmd),
             TradingCommand::SubmitOrderList(cmd) => self.handle_submit_order_list(client, cmd),
             TradingCommand::ModifyOrder(cmd) => self.handle_modify_order(client, cmd),
@@ -2120,6 +2123,33 @@ impl ExecutionEngine {
             TradingCommand::CancelAllOrders(cmd) => Some(cmd.instrument_id),
             TradingCommand::QueryOrder(cmd) => Some(cmd.instrument_id),
             TradingCommand::QueryAccount(_) => None,
+        }
+    }
+
+    fn handle_order_preview(&self, client: &dyn ExecutionClient, cmd: SubmitOrder) {
+        let instrument_exists = self.cache.borrow().instrument(&cmd.instrument_id).is_some();
+        if !instrument_exists {
+            log::error!(
+                "Cannot request order preview: no instrument found for {}",
+                cmd.instrument_id
+            );
+            return;
+        }
+
+        let order_venue = cmd.instrument_id.venue;
+        let client_venue = client.venue();
+        if !client.handles_order_venue(order_venue) {
+            log::error!(
+                "Cannot request order preview: client {} handles {}, not {}",
+                client.client_id(),
+                client_venue,
+                order_venue
+            );
+            return;
+        }
+
+        if let Err(e) = client.preview_order(cmd) {
+            log::error!("Order preview request failed: {e}");
         }
     }
 

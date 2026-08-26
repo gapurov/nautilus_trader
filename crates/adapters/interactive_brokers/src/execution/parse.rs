@@ -359,7 +359,7 @@ fn parse_ib_order_pricing_fields(
     ))
 }
 
-fn decimal_from_f64(value: f64) -> anyhow::Result<Decimal> {
+pub(super) fn decimal_from_f64(value: f64) -> anyhow::Result<Decimal> {
     Decimal::from_str(&value.to_string())
         .with_context(|| format!("Failed to convert IB floating-point value {value} to Decimal"))
 }

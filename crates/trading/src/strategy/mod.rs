@@ -30,7 +30,8 @@ use nautilus_common::{
     logging::{CMD, EVT, RECV, SEND},
     messages::execution::{
         BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+        ORDER_PREVIEW_PARAM, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        TradingCommand,
     },
     msgbus::{self, MessagingSwitchboard},
     timer::TimeEvent,
@@ -133,6 +134,56 @@ pub trait Strategy: DataActor {
         Self: StrategyNative,
     {
         StrategyNative::strategy_core(self).portfolio_api()
+    }
+
+    /// Requests a non-mutating broker diagnostic for a proposed order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy is not registered or the order is not initialized.
+    fn request_order_preview(
+        &mut self,
+        order: OrderAny,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+    ) -> anyhow::Result<()>
+    where
+        Self: StrategyNative,
+    {
+        let core = StrategyNative::strategy_core_mut(self);
+        let trader_id = registered_trader_id(core)?;
+        let strategy_id = registered_strategy_id(core)?;
+        let ts_init = core.clock_mut().timestamp_ns();
+
+        if order.status() != OrderStatus::Initialized {
+            anyhow::bail!(
+                "Order preview denied: invalid status for {}, expected INITIALIZED",
+                order.client_order_id()
+            );
+        }
+
+        let mut params = params.unwrap_or_default();
+        params.insert(
+            ORDER_PREVIEW_PARAM.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let command = SubmitOrder::new(
+            trader_id,
+            client_id,
+            strategy_id,
+            order.instrument_id(),
+            order.client_order_id(),
+            order.init_event().clone(),
+            None,
+            None,
+            Some(params),
+            UUID4::new(),
+            ts_init,
+            None,
+        );
+
+        send_exec_command(TradingCommand::SubmitOrder(command));
+        Ok(())
     }
 
     /// Submits an order.
@@ -2917,6 +2968,36 @@ mod tests {
         strategy.on_order_filled(&OrderFilledSpec::builder().build());
         strategy.on_order_fill_voided(&OrderFillVoidedSpec::builder().build());
         strategy.on_position_event(make_position_opened());
+    }
+
+    #[rstest]
+    fn test_request_order_preview_bypasses_order_state_and_risk() {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        let (exec_handler, exec_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("ExecEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            exec_handler,
+        );
+        let order = make_initialized_market_order("O-20250208-PREVIEW-001");
+
+        strategy
+            .request_order_preview(order.clone(), None, None)
+            .unwrap();
+
+        assert!(
+            !strategy
+                .core
+                .cache_rc()
+                .borrow()
+                .order_exists(&order.client_order_id())
+        );
+        let messages = exec_messages.get_messages();
+        let TradingCommand::SubmitOrder(command) = &messages[0] else {
+            panic!("expected submit-shaped order preview command")
+        };
+        assert!(command.is_order_preview());
     }
 
     #[rstest]

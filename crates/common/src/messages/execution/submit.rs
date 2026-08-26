@@ -25,6 +25,9 @@ use nautilus_model::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Submit-order parameter which requests a non-mutating broker preview.
+pub const ORDER_PREVIEW_PARAM: &str = "order_preview";
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub struct SubmitOrder {
@@ -45,6 +48,15 @@ pub struct SubmitOrder {
 }
 
 impl SubmitOrder {
+    /// Returns whether this command requests a non-mutating broker order preview.
+    #[must_use]
+    pub fn is_order_preview(&self) -> bool {
+        self.params
+            .as_ref()
+            .and_then(|params| params.get_bool(ORDER_PREVIEW_PARAM))
+            .unwrap_or(false)
+    }
+
     /// Creates a new [`SubmitOrder`] instance.
     #[expect(clippy::too_many_arguments)]
     #[must_use]

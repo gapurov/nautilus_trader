@@ -185,6 +185,22 @@ async fn handle_get_wallet_balance(headers: HeaderMap) -> impl IntoResponse {
     Json(wallet).into_response()
 }
 
+async fn handle_get_account_info(headers: HeaderMap) -> impl IntoResponse {
+    if !has_auth_headers(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "retCode": 10003,
+                "retMsg": "Invalid API key",
+                "result": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+    Json(load_test_data("http_get_account_info.json")).into_response()
+}
+
 async fn handle_get_positions(headers: HeaderMap) -> impl IntoResponse {
     if !has_auth_headers(&headers) {
         return (
@@ -605,6 +621,7 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/v5/market/instruments-info", get(handle_get_instruments))
         .route("/v5/account/fee-rate", get(handle_get_fee_rate))
         .route("/v5/account/wallet-balance", get(handle_get_wallet_balance))
+        .route("/v5/account/info", get(handle_get_account_info))
         .route("/v5/position/list", get(handle_get_positions))
         .route("/v5/order/realtime", get(handle_get_orders_realtime))
         .route("/v5/order/create", post(handle_post_order))
@@ -1002,6 +1019,40 @@ async fn test_exec_client_connect_applies_leverage_and_margin_mode() {
     drop(margin_reqs);
 
     client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_exec_client_connect_fails_when_margin_mode_verification_mismatches() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let account_id = AccountId::from("BYBIT-001");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    add_test_account_to_cache(&cache, account_id);
+
+    let core = ExecutionClientCore::new(
+        TraderId::from("TESTER-001"),
+        *BYBIT_CLIENT_ID,
+        *BYBIT_VENUE,
+        OmsType::Netting,
+        account_id,
+        AccountType::Margin,
+        None,
+        cache,
+    );
+    let mut config = create_test_exec_config(addr);
+    config.margin_mode = Some(BybitMarginMode::PortfolioMargin);
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    set_exec_event_sender(tx);
+
+    let mut client = BybitExecutionClient::new(core, config).unwrap();
+    let error = client.connect().await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("expected PORTFOLIO_MARGIN, was REGULAR_MARGIN")
+    );
 }
 
 #[rstest]

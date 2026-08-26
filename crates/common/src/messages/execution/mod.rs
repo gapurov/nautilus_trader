@@ -38,7 +38,7 @@ pub use self::{
         GenerateOrderStatusReports, GenerateOrderStatusReportsBuilder,
         GeneratePositionStatusReports, GeneratePositionStatusReportsBuilder,
     },
-    submit::{SubmitOrder, SubmitOrderList},
+    submit::{ORDER_PREVIEW_PARAM, SubmitOrder, SubmitOrderList},
 };
 
 /// Execution report variants for reconciliation.

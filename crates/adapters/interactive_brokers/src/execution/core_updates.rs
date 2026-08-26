@@ -285,19 +285,7 @@ impl InteractiveBrokersExecutionClient {
                 }
             }
             OrderUpdate::OpenOrder(order_data) => {
-                if !Self::is_active_open_order(&order_data.order) {
-                    tracing::debug!(
-                        "Ignoring deactivated open order: order_id={}, order_ref={}",
-                        order_data.order_id,
-                        order_data.order.order_ref
-                    );
-                    return Ok(());
-                }
-
-                if order_data.order.what_if
-                    && IbOrderStatus::from_str(order_data.order_state.status.as_str())
-                        .is_ok_and(|status| status == IbOrderStatus::PreSubmitted)
-                {
+                if order_data.order.what_if {
                     Self::handle_whatif_order(
                         order_data,
                         venue_order_id_map,
@@ -305,12 +293,20 @@ impl InteractiveBrokersExecutionClient {
                         trader_id_map,
                         strategy_id_map,
                         instrument_provider,
-                        exec_sender,
                         clock.get_time_ns(),
                         account_id,
                     )
                     .await?;
                 } else {
+                    if !Self::is_active_open_order(&order_data.order) {
+                        tracing::debug!(
+                            "Ignoring deactivated open order: order_id={}, order_ref={}",
+                            order_data.order_id,
+                            order_data.order.order_ref
+                        );
+                        return Ok(());
+                    }
+
                     let status_str = order_data.order_state.status.as_str();
                     tracing::debug!(
                         "Received open order: order_id={}, status={}, order_ref={}",
@@ -1138,7 +1134,6 @@ impl InteractiveBrokersExecutionClient {
         trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
         strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
         instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
-        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         ts_init: UnixNanos,
         account_id: AccountId,
     ) -> anyhow::Result<()> {
@@ -1164,32 +1159,70 @@ impl InteractiveBrokersExecutionClient {
                 Self::resolve_contract_instrument_id(instrument_provider, &order_data.contract)
             })?;
 
-        let (trader_id, strategy_id) = Self::get_required_order_actor_ids(
+        let (_trader_id, strategy_id) = Self::get_required_order_actor_ids(
             order_data.order_id,
             trader_id_map,
             strategy_id_map,
         )?;
 
-        let reason_json = serde_json::to_string(&order_data.order_state)
-            .unwrap_or_else(|_| format!("whatIf analysis for order {}", order_data.order_id));
-
-        let event = OrderRejected::new(
-            trader_id,
+        let decimal = |value: Option<f64>| value.map(parse::decimal_from_f64).transpose();
+        let state = &order_data.order_state;
+        let preview = InteractiveBrokersOrderPreview {
+            account_id,
             strategy_id,
             instrument_id,
             client_order_id,
-            account_id,
-            Ustr::from(&reason_json),
-            UUID4::new(),
+            status: state.status.as_str().to_string(),
+            initial_margin_before: decimal(state.initial_margin_before)?,
+            initial_margin_change: decimal(state.initial_margin_change)?,
+            initial_margin_after: decimal(state.initial_margin_after)?,
+            maintenance_margin_before: decimal(state.maintenance_margin_before)?,
+            maintenance_margin_change: decimal(state.maintenance_margin_change)?,
+            maintenance_margin_after: decimal(state.maintenance_margin_after)?,
+            equity_with_loan_before: decimal(state.equity_with_loan_before)?,
+            equity_with_loan_change: decimal(state.equity_with_loan_change)?,
+            equity_with_loan_after: decimal(state.equity_with_loan_after)?,
+            initial_margin_before_outside_rth: decimal(state.initial_margin_before_outside_rth)?,
+            initial_margin_change_outside_rth: decimal(state.initial_margin_change_outside_rth)?,
+            initial_margin_after_outside_rth: decimal(state.initial_margin_after_outside_rth)?,
+            maintenance_margin_before_outside_rth: decimal(
+                state.maintenance_margin_before_outside_rth,
+            )?,
+            maintenance_margin_change_outside_rth: decimal(
+                state.maintenance_margin_change_outside_rth,
+            )?,
+            maintenance_margin_after_outside_rth: decimal(
+                state.maintenance_margin_after_outside_rth,
+            )?,
+            equity_with_loan_before_outside_rth: decimal(
+                state.equity_with_loan_before_outside_rth,
+            )?,
+            equity_with_loan_change_outside_rth: decimal(
+                state.equity_with_loan_change_outside_rth,
+            )?,
+            equity_with_loan_after_outside_rth: decimal(state.equity_with_loan_after_outside_rth)?,
+            commission: decimal(state.commission)?,
+            minimum_commission: decimal(state.minimum_commission)?,
+            maximum_commission: decimal(state.maximum_commission)?,
+            commission_currency: state.commission_currency.clone(),
+            margin_currency: state.margin_currency.clone(),
+            suggested_size: decimal(state.suggested_size)?,
+            reject_reason: state.reject_reason.clone(),
+            warning_text: state.warning_text.clone(),
+            ts_event: ts_init,
             ts_init,
-            ts_init,
-            false,
-            false,
-        );
+        };
 
-        exec_sender
-            .send(ExecutionEvent::Order(OrderEventAny::Rejected(event)))
-            .map_err(|e| anyhow::anyhow!("Failed to send order rejected event: {e}"))?;
+        Self::remove_preview_tracking(
+            order_data.order_id,
+            venue_order_id_map,
+            instrument_id_map,
+            trader_id_map,
+            strategy_id_map,
+        )?;
+        get_data_event_sender()
+            .send(DataEvent::Data(Data::Custom(preview.into_custom_data())))
+            .map_err(|e| anyhow::anyhow!("Failed to send IB order preview: {e}"))?;
 
         tracing::debug!(
             "What-if analysis completed for order {}: margin change={:?}, commission={:?}",

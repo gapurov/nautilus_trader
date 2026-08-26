@@ -198,6 +198,7 @@ pub fn bybit(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::common::types::BybitMarginBorrowResult>()?;
     m.add_class::<crate::common::types::BybitMarginRepayResult>()?;
     m.add_class::<crate::common::types::BybitMarginStatusResult>()?;
+    m.add_class::<crate::common::types::BybitOptionCollateralUnavailable>()?;
     m.add_class::<crate::websocket::client::BybitWebSocketClient>()?;
     m.add_class::<crate::websocket::messages::BybitWebSocketError>()?;
     m.add_class::<params::BybitWsPlaceOrderParams>()?;

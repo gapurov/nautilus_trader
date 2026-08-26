@@ -11,6 +11,140 @@ use super::*;
 
 #[allow(dead_code)]
 impl InteractiveBrokersExecutionClient {
+    pub(super) fn publish_preview_unavailable(
+        cmd: &SubmitOrder,
+        account_id: AccountId,
+        reason: String,
+        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<()> {
+        let preview = InteractiveBrokersOrderPreview::unavailable(
+            account_id,
+            cmd.strategy_id,
+            cmd.instrument_id,
+            cmd.client_order_id,
+            reason,
+            ts_init,
+        );
+        data_sender
+            .send(DataEvent::Data(Data::Custom(preview.into_custom_data())))
+            .map_err(|e| anyhow::anyhow!("Failed to send IB order preview: {e}"))
+    }
+
+    pub(super) fn remove_preview_tracking(
+        ib_order_id: i32,
+        venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
+        instrument_id_map: &Arc<Mutex<AHashMap<i32, InstrumentId>>>,
+        trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
+        strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
+    ) -> anyhow::Result<()> {
+        venue_order_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock venue order ID map"))?
+            .remove(&ib_order_id);
+        instrument_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock instrument ID map"))?
+            .remove(&ib_order_id);
+        trader_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock trader ID map"))?
+            .remove(&ib_order_id);
+        strategy_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock strategy ID map"))?
+            .remove(&ib_order_id);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn handle_preview_order_async(
+        cmd: &SubmitOrder,
+        client: &Arc<Client>,
+        venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
+        instrument_id_map: &Arc<Mutex<AHashMap<i32, InstrumentId>>>,
+        trader_id_map: &Arc<Mutex<AHashMap<i32, TraderId>>>,
+        strategy_id_map: &Arc<Mutex<AHashMap<i32, StrategyId>>>,
+        next_order_id: &Arc<Mutex<i32>>,
+        instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
+        account_id: AccountId,
+        order_submit_lock: &Arc<AsyncMutex<()>>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !cmd.order_init.post_only,
+            "`post_only` not supported by Interactive Brokers"
+        );
+
+        let is_inverse = instrument_provider
+            .find(&cmd.instrument_id)
+            .map(|instrument| instrument.is_inverse())
+            .unwrap_or(false);
+        anyhow::ensure!(
+            !cmd.order_init.quote_quantity || is_inverse,
+            "UNSUPPORTED_QUOTE_QUANTITY"
+        );
+        anyhow::ensure!(
+            !matches!(
+                cmd.order_init.order_type,
+                OrderType::TrailingStopMarket | OrderType::TrailingStopLimit
+            ) || cmd.order_init.trailing_offset_type == Some(TrailingOffsetType::Price),
+            "Interactive Brokers previews support only price trailing offsets"
+        );
+
+        let contract =
+            Self::resolve_contract_for_instrument(cmd.instrument_id, instrument_provider)?;
+        let contract = Self::contract_with_order_exchange_param(contract, cmd.params.as_ref())?;
+        let order_any = OrderAny::try_from(cmd.order_init.clone())
+            .context("Failed to construct preview order from `OrderInitialized`")?;
+        let _submit_guard = order_submit_lock.lock().await;
+        let ib_order_id = Self::reserve_next_local_order_id(next_order_id)?;
+        let mut ib_order = nautilus_order_to_ib_order(
+            &order_any,
+            &contract,
+            instrument_provider,
+            ib_order_id,
+            cmd.client_order_id.as_str(),
+        )
+        .context("Failed to transform preview order")?;
+        let ib_account = account_id
+            .to_string()
+            .split_once('-')
+            .map_or_else(|| account_id.to_string(), |(_, value)| value.to_string());
+        ib_order.account = ib_account.clone();
+        ib_order.clearing_account = ib_account;
+        ib_order.what_if = true;
+
+        venue_order_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock venue order ID map"))?
+            .insert(ib_order_id, cmd.client_order_id);
+        instrument_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock instrument ID map"))?
+            .insert(ib_order_id, cmd.instrument_id);
+        trader_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock trader ID map"))?
+            .insert(ib_order_id, cmd.order_init.trader_id);
+        strategy_id_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock strategy ID map"))?
+            .insert(ib_order_id, cmd.strategy_id);
+
+        if let Err(e) = client.submit_order(ib_order_id, &contract, &ib_order).await {
+            Self::remove_preview_tracking(
+                ib_order_id,
+                venue_order_id_map,
+                instrument_id_map,
+                trader_id_map,
+                strategy_id_map,
+            )?;
+            return Err(e).context("Failed to request IB order preview");
+        }
+
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_submit_order_async(
         cmd: &SubmitOrder,

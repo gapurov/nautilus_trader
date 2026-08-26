@@ -38,8 +38,8 @@ use nautilus_common::{
     messages::{
         ExecutionReport,
         execution::{
-            BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder, QueryAccount,
-            SubmitOrder, SubmitOrderList, TradingCommand,
+            BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder, ORDER_PREVIEW_PARAM,
+            QueryAccount, SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
     msgbus::{
@@ -49,7 +49,7 @@ use nautilus_common::{
     timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{
-    UUID4, UnixNanos,
+    Params, UUID4, UnixNanos,
     datetime::{NANOSECONDS_IN_MINUTE, NANOSECONDS_IN_SECOND},
 };
 use nautilus_execution::engine::{
@@ -3583,6 +3583,70 @@ fn test_submit_order_successfully_processes_and_caches_order(
         cached_order.status(),
         OrderStatus::Initialized,
         "Order should be in Initialized status after submission"
+    );
+}
+
+#[rstest]
+fn test_order_preview_bypasses_order_state_and_routes_to_preview_capability(
+    mut execution_engine: ExecutionEngine,
+) {
+    let instrument = futures_contract_xcme();
+    let client_id = ClientId::from("IB");
+    let stub_client = StubExecutionClient::new(
+        client_id,
+        AccountId::from("IB-001"),
+        instrument.id.venue,
+        OmsType::Netting,
+        None,
+    );
+    let previewed_order_ids = stub_client.previewed_order_ids();
+    let submitted_order_ids = stub_client.submitted_order_ids();
+    execution_engine
+        .register_client(Box::new(stub_client))
+        .unwrap();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id)
+        .price(Price::from("5000.00"))
+        .quantity(Quantity::from(1))
+        .build();
+    let mut params = Params::new();
+    params.insert(
+        ORDER_PREVIEW_PARAM.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    let command = SubmitOrder::new(
+        order.trader_id(),
+        Some(client_id),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        Some(params),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+
+    execution_engine.execute(TradingCommand::SubmitOrder(command));
+
+    assert_eq!(
+        previewed_order_ids.borrow().as_slice(),
+        &[order.client_order_id()]
+    );
+    assert!(submitted_order_ids.borrow().is_empty());
+    assert!(
+        !execution_engine
+            .cache()
+            .borrow()
+            .order_exists(&order.client_order_id())
     );
 }
 

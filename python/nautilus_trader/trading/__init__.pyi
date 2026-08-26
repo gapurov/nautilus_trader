@@ -507,6 +507,9 @@ class Strategy:
     def register_indicator_for_bars(
         self, bar_type: model.BarType, indicator: typing.Any
     ) -> None: ...
+    def request_order_preview(
+        self, order: typing.Any, client_id: model.ClientId | None = None, params: dict | None = None
+    ) -> None: ...
     def submit_order(
         self,
         order: typing.Any,

@@ -18,6 +18,7 @@
         {
           "coin": "BTC",
           "equity": "0.00102964",
+          "usdValue": "36.70759517",
           "walletBalance": "0.00102964",
           "availableToWithdraw": "0.00092964",
           "availableToBorrow": "",
@@ -31,6 +32,7 @@
         {
           "coin": "USDT",
           "equity": "10226.20575506",
+          "usdValue": "10226.20575506",
           "walletBalance": "9647.75537647",
           "availableToWithdraw": "9519.89806037",
           "availableToBorrow": "",

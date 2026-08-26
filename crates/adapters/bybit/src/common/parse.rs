@@ -198,13 +198,16 @@ use ustr::Ustr;
 use crate::{
     common::{
         enums::{
-            BybitBboSideType, BybitContractType, BybitKlineInterval, BybitMarginTrading,
-            BybitMarketUnit, BybitOptionType, BybitOrderSide, BybitOrderStatus, BybitOrderType,
-            BybitPositionIdx, BybitPositionMode, BybitPositionSide, BybitProductType,
-            BybitStopOrderType, BybitTimeInForce, BybitTpSlMode, BybitTriggerDirection,
-            BybitTriggerType,
+            BybitBboSideType, BybitContractType, BybitKlineInterval, BybitMarginMode,
+            BybitMarginTrading, BybitMarketUnit, BybitOptionType, BybitOrderSide, BybitOrderStatus,
+            BybitOrderType, BybitPositionIdx, BybitPositionMode, BybitPositionSide,
+            BybitProductType, BybitStopOrderType, BybitTimeInForce, BybitTpSlMode,
+            BybitTriggerDirection, BybitTriggerType,
         },
         symbol::BybitSymbol,
+        types::{
+            BybitAccountCoinInfo, BybitAccountUsdConversionRate, BybitOptionCollateralUnavailable,
+        },
     },
     http::{
         models::{
@@ -220,6 +223,97 @@ use crate::{
 const BYBIT_HOUR_INTERVALS: &[u64] = &[1, 2, 4, 6, 12];
 
 const BYBIT_POST_ONLY_REJECT_REASON: &str = "EC_PostOnlyWillTakeLiquidity";
+
+pub(crate) struct BybitAccountStateInfo<'a> {
+    pub account_type: &'a str,
+    pub margin_mode: BybitMarginMode,
+    pub total_wallet_balance: &'a str,
+    pub total_equity: &'a str,
+    pub total_available_balance: &'a str,
+    pub total_margin_balance: &'a str,
+    pub total_initial_margin: &'a str,
+    pub total_maintenance_margin: &'a str,
+    pub total_perp_upl: &'a str,
+    pub account_im_rate: &'a str,
+    pub account_mm_rate: &'a str,
+    pub account_ltv: &'a str,
+    pub coins: Vec<BybitAccountCoinInfo>,
+}
+
+impl BybitAccountStateInfo<'_> {
+    pub(crate) fn into_params(self) -> anyhow::Result<Params> {
+        let collateral_unavailable = BybitOptionCollateralUnavailable::new(self.margin_mode);
+        let mut usdt_coins = self
+            .coins
+            .iter()
+            .filter(|coin| coin.coin.eq_ignore_ascii_case("USDT"));
+        let usdt = usdt_coins
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("USDT wallet values are missing"))?;
+        anyhow::ensure!(
+            usdt_coins.next().is_none(),
+            "USDT wallet values are ambiguous"
+        );
+        let conversion = BybitAccountUsdConversionRate::try_from_coin(usdt)?;
+        let mut params = Params::new();
+        for (key, value) in [
+            ("account_type", self.account_type),
+            ("margin_mode", self.margin_mode.as_ref()),
+            ("total_wallet_balance", self.total_wallet_balance),
+            ("total_equity", self.total_equity),
+            ("total_available_balance", self.total_available_balance),
+            ("total_margin_balance", self.total_margin_balance),
+            ("total_initial_margin", self.total_initial_margin),
+            ("total_maintenance_margin", self.total_maintenance_margin),
+            ("total_perp_upl", self.total_perp_upl),
+            ("account_im_rate", self.account_im_rate),
+            ("account_mm_rate", self.account_mm_rate),
+            ("account_ltv", self.account_ltv),
+        ] {
+            params.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+        params.insert(
+            "option_collateral_effect_status".to_string(),
+            serde_json::Value::String("unavailable".to_string()),
+        );
+        params.insert(
+            "option_collateral_effect_missing_inputs".to_string(),
+            serde_json::Value::Array(
+                collateral_unavailable
+                    .missing_authoritative_inputs
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+        params.insert(
+            "option_collateral_effect_reason".to_string(),
+            serde_json::Value::String(collateral_unavailable.reason),
+        );
+        let mut coins = serde_json::Map::new();
+        for coin in self.coins {
+            let coin_code = coin.coin.to_ascii_uppercase();
+            let value = serde_json::json!({
+                "wallet_balance": coin.wallet_balance,
+                "equity": coin.equity,
+                "usd_value": coin.usd_value,
+            });
+            anyhow::ensure!(
+                coins.insert(coin_code.clone(), value).is_none(),
+                "duplicate wallet values for {coin_code}"
+            );
+        }
+        params.insert("coins".to_string(), serde_json::Value::Object(coins));
+        params.insert(
+            "usdt_to_account_usd_rate".to_string(),
+            serde_json::Value::String(conversion.rate.to_string()),
+        );
+        Ok(params)
+    }
+}
 
 /// Returns whether a Bybit rejection reason indicates a post-only order that
 /// would have taken liquidity (crossed the book).
@@ -1196,6 +1290,7 @@ pub fn parse_position_status_report(
 /// - Currency is invalid.
 pub fn parse_account_state(
     wallet_balance: &BybitWalletBalance,
+    margin_mode: BybitMarginMode,
     account_id: AccountId,
     ts_init: UnixNanos,
 ) -> anyhow::Result<AccountState> {
@@ -1250,6 +1345,32 @@ pub fn parse_account_state(
     // Use current time as ts_event since Bybit doesn't provide this in wallet balance
     let ts_event = ts_init;
 
+    let info = BybitAccountStateInfo {
+        account_type: wallet_balance.account_type.as_ref(),
+        margin_mode,
+        total_wallet_balance: &wallet_balance.total_wallet_balance,
+        total_equity: &wallet_balance.total_equity,
+        total_available_balance: &wallet_balance.total_available_balance,
+        total_margin_balance: &wallet_balance.total_margin_balance,
+        total_initial_margin: &wallet_balance.total_initial_margin,
+        total_maintenance_margin: &wallet_balance.total_maintenance_margin,
+        total_perp_upl: &wallet_balance.total_perp_upl,
+        account_im_rate: &wallet_balance.account_im_rate,
+        account_mm_rate: &wallet_balance.account_mm_rate,
+        account_ltv: &wallet_balance.account_ltv,
+        coins: wallet_balance
+            .coin
+            .iter()
+            .map(|coin| BybitAccountCoinInfo {
+                coin: coin.coin.to_string(),
+                wallet_balance: coin.wallet_balance.to_string(),
+                equity: coin.equity.clone(),
+                usd_value: coin.usd_value.clone(),
+            })
+            .collect(),
+    }
+    .into_params()?;
+
     Ok(AccountState::new(
         account_id,
         account_type,
@@ -1260,7 +1381,8 @@ pub fn parse_account_state(
         ts_event,
         ts_init,
         None,
-    ))
+    )
+    .with_info(Some(info)))
 }
 
 pub(crate) fn parse_price_with_precision(

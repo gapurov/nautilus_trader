@@ -21,9 +21,14 @@ use ibapi::{
     },
     subscriptions::Subscription,
 };
-use nautilus_common::{cache::Cache, live::runner::replace_exec_event_sender};
+use nautilus_common::{
+    cache::Cache,
+    live::runner::{replace_data_event_sender, replace_exec_event_sender},
+    messages::DataEvent,
+};
 use nautilus_live::{ExecutionClientCore, execution::failure::CommandFailure};
 use nautilus_model::{
+    data::Data,
     enums::{AccountType, AssetClass, LiquiditySide, OmsType, OrderSide, OrderType},
     events::OrderInitialized,
     identifiers::{
@@ -1231,14 +1236,8 @@ fn create_test_open_order(order_id: i32, status: &str, order_ref: &str) -> IBOrd
     }
 }
 
-#[rstest]
-#[case(false, "Submitted")]
-#[case(true, "PreSubmitted")]
 #[tokio::test]
-async fn handle_order_update_ignores_deactivated_open_order(
-    #[case] what_if: bool,
-    #[case] status: &str,
-) {
+async fn handle_order_update_ignores_deactivated_open_order() {
     let order_id = 7009;
     let client_order_id = ClientOrderId::from("O-DEACTIVATED");
     let equity = equity_aapl();
@@ -1260,8 +1259,8 @@ async fn handle_order_update_ignores_deactivated_open_order(
     let order_fill_progress = Arc::new(Mutex::new(AHashMap::new()));
     let pending_cancel_orders = Arc::new(Mutex::new(ahash::AHashSet::new()));
     let pending_execution_cache = Arc::new(Mutex::new(PendingExecutionCache::new()));
-    let mut open_order = create_test_open_order(order_id, status, client_order_id.as_str());
-    open_order.order.what_if = what_if;
+    let mut open_order = create_test_open_order(order_id, "Submitted", client_order_id.as_str());
+    open_order.order.what_if = false;
     open_order.order.deactivate = true;
     open_order.order.total_quantity = 1.0;
 
@@ -1337,6 +1336,75 @@ async fn handle_order_update_ignores_deactivated_open_order(
             .unwrap()
             .accepted
     );
+}
+
+#[rstest]
+#[tokio::test]
+async fn handle_whatif_order_publishes_typed_preview_without_order_event() {
+    let order_id = 7010;
+    let client_order_id = ClientOrderId::from("O-PREVIEW");
+    let instrument_id = create_test_stock_instrument();
+    let venue_order_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let instrument_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let trader_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    let strategy_id_map = Arc::new(Mutex::new(AHashMap::new()));
+    venue_order_id_map
+        .lock()
+        .unwrap()
+        .insert(order_id, client_order_id);
+    instrument_id_map
+        .lock()
+        .unwrap()
+        .insert(order_id, instrument_id);
+    trader_id_map
+        .lock()
+        .unwrap()
+        .insert(order_id, TraderId::from("TRADER-001"));
+    strategy_id_map
+        .lock()
+        .unwrap()
+        .insert(order_id, StrategyId::from("STRATEGY-001"));
+
+    let (data_sender, mut data_receiver) = tokio::sync::mpsc::unbounded_channel();
+    replace_data_event_sender(data_sender);
+    let mut order_data = create_test_open_order(order_id, "PreSubmitted", client_order_id.as_str());
+    order_data.order.what_if = true;
+    order_data.order_state.initial_margin_before = Some(1000.0);
+    order_data.order_state.initial_margin_change = Some(125.5);
+    order_data.order_state.initial_margin_after = Some(1125.5);
+    order_data.order_state.commission = Some(1.25);
+    order_data.order_state.commission_currency = "USD".to_string();
+    order_data.order_state.margin_currency = "USD".to_string();
+
+    InteractiveBrokersExecutionClient::handle_whatif_order(
+        &order_data,
+        &venue_order_id_map,
+        &instrument_id_map,
+        &trader_id_map,
+        &strategy_id_map,
+        &create_test_instrument_provider(),
+        UnixNanos::new(42),
+        AccountId::from("IB-001"),
+    )
+    .await
+    .unwrap();
+
+    let DataEvent::Data(Data::Custom(custom)) = data_receiver.try_recv().unwrap() else {
+        panic!("expected typed custom preview data")
+    };
+    let preview = custom
+        .data
+        .as_any()
+        .downcast_ref::<InteractiveBrokersOrderPreview>()
+        .expect("expected InteractiveBrokersOrderPreview");
+    assert_eq!(preview.client_order_id, client_order_id);
+    assert_eq!(preview.status, "PreSubmitted");
+    assert_eq!(preview.initial_margin_change, Some(Decimal::new(1255, 1)));
+    assert_eq!(preview.commission, Some(Decimal::new(125, 2)));
+    assert!(venue_order_id_map.lock().unwrap().is_empty());
+    assert!(instrument_id_map.lock().unwrap().is_empty());
+    assert!(trader_id_map.lock().unwrap().is_empty());
+    assert!(strategy_id_map.lock().unwrap().is_empty());
 }
 
 #[rstest]
@@ -1594,7 +1662,8 @@ fn test_parse_historical_fill_report_uses_provider_resolved_stock_venue() {
 
     let report = client
         .parse_historical_fill_report(&cmd, &exec_data, 1.25, "USD", UnixNanos::default())
-        .unwrap();
+        .unwrap()
+        .expect("fill should match filters");
 
     assert_eq!(report.instrument_id, instrument_id);
     assert_eq!(
@@ -1646,7 +1715,8 @@ fn test_parse_historical_fill_report_uses_cached_bag_spread_id() {
 
     let report = client
         .parse_historical_fill_report(&cmd, &exec_data, 2.00, "USD", UnixNanos::default())
-        .unwrap();
+        .unwrap()
+        .expect("fill should match filters");
 
     assert_eq!(report.instrument_id, instrument_id);
     assert_eq!(
@@ -1657,6 +1727,118 @@ fn test_parse_historical_fill_report_uses_cached_bag_spread_id() {
     assert_eq!(report.venue_order_id, VenueOrderId::from("7001"));
     assert_eq!(report.last_qty, Quantity::from(1));
     assert_eq!(report.last_px, Price::from("1.25"));
+}
+
+#[rstest]
+fn test_parse_historical_fill_report_fails_closed_on_unresolved_contract() {
+    let (client, _rx, _cache) = create_test_execution_client();
+    let exec_data = create_test_bag_execution_data(7001, "exec-unresolved-001");
+    let cmd = GenerateFillReportsBuilder::default()
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
+
+    let error = client
+        .parse_historical_fill_report(&cmd, &exec_data, 2.00, "USD", UnixNanos::default())
+        .unwrap_err();
+    let reconciliation = error
+        .downcast_ref::<InteractiveBrokersReconciliationError>()
+        .expect("expected typed reconciliation error");
+
+    assert!(matches!(
+        reconciliation,
+        InteractiveBrokersReconciliationError::Fill { execution_id, .. }
+            if execution_id == "exec-unresolved-001"
+    ));
+}
+
+#[rstest]
+fn test_historical_fill_reconciliation_fails_closed_without_commission() {
+    let mut pending_exec_data = AHashMap::new();
+    pending_exec_data.insert(
+        "exec-missing-commission".to_string(),
+        create_test_stock_execution_data(0, 123, "exec-missing-commission"),
+    );
+
+    let error = InteractiveBrokersExecutionClient::ensure_historical_commission_pairs_complete(
+        &pending_exec_data,
+        &AHashMap::new(),
+    )
+    .unwrap_err();
+    let reconciliation = error
+        .downcast_ref::<InteractiveBrokersReconciliationError>()
+        .expect("expected typed reconciliation error");
+
+    assert_eq!(
+        reconciliation,
+        &InteractiveBrokersReconciliationError::Commission {
+            execution_ids: vec!["exec-missing-commission".to_string()],
+            detail: "matching commission reports were not provided".to_string(),
+        }
+    );
+}
+
+#[rstest]
+fn test_historical_fill_reconciliation_fails_closed_without_execution() {
+    let mut pending_commissions = AHashMap::new();
+    pending_commissions.insert("exec-missing".to_string(), (1.25, "USD".to_string()));
+
+    let error = InteractiveBrokersExecutionClient::ensure_historical_commission_pairs_complete(
+        &AHashMap::new(),
+        &pending_commissions,
+    )
+    .unwrap_err();
+    let reconciliation = error
+        .downcast_ref::<InteractiveBrokersReconciliationError>()
+        .expect("expected typed reconciliation error");
+
+    assert_eq!(
+        reconciliation,
+        &InteractiveBrokersReconciliationError::Commission {
+            execution_ids: vec!["exec-missing".to_string()],
+            detail: "matching execution reports were not provided".to_string(),
+        }
+    );
+}
+
+#[rstest]
+fn test_order_reconciliation_fails_closed_without_order_data() {
+    let order_data_ids = AHashSet::new();
+    let order_status_ids = AHashSet::from_iter([42]);
+
+    let error = InteractiveBrokersExecutionClient::ensure_order_statuses_have_data(
+        &order_data_ids,
+        &order_status_ids,
+    )
+    .unwrap_err();
+    let reconciliation = error
+        .downcast_ref::<InteractiveBrokersReconciliationError>()
+        .expect("expected typed reconciliation error");
+
+    assert_eq!(
+        reconciliation,
+        &InteractiveBrokersReconciliationError::Order {
+            order_id: 42,
+            detail: "order status had no matching order data".to_string(),
+        }
+    );
+}
+
+#[rstest]
+fn test_position_reconciliation_fails_closed_without_position_end() {
+    let error =
+        InteractiveBrokersExecutionClient::ensure_position_snapshot_complete(false).unwrap_err();
+    let reconciliation = error
+        .downcast_ref::<InteractiveBrokersReconciliationError>()
+        .expect("expected typed reconciliation error");
+
+    assert_eq!(
+        reconciliation,
+        &InteractiveBrokersReconciliationError::Stream {
+            report_type: "position",
+            detail: "stream ended before PositionEnd".to_string(),
+        }
+    );
 }
 
 #[tokio::test]

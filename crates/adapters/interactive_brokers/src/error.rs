@@ -17,6 +17,35 @@
 
 use thiserror::Error;
 
+/// Fail-closed errors raised when IBKR reconciliation cannot prove complete broker state.
+#[derive(Error, Debug, Clone, Eq, PartialEq)]
+pub enum InteractiveBrokersReconciliationError {
+    /// An open order could not be converted into a complete report.
+    #[error("Unresolved IBKR order {order_id}: {detail}")]
+    Order { order_id: i32, detail: String },
+    /// A position could not be converted into a complete report.
+    #[error("Unresolved IBKR position contract {contract_id}: {detail}")]
+    Position { contract_id: i32, detail: String },
+    /// An execution could not be converted into a complete fill report.
+    #[error("Unresolved IBKR execution {execution_id}: {detail}")]
+    Fill {
+        execution_id: String,
+        detail: String,
+    },
+    /// Execution and commission streams did not form complete pairs.
+    #[error("Unresolved IBKR commission facts for executions {execution_ids:?}: {detail}")]
+    Commission {
+        execution_ids: Vec<String>,
+        detail: String,
+    },
+    /// A reconciliation subscription returned an error before a complete snapshot.
+    #[error("IBKR {report_type} reconciliation stream failed: {detail}")]
+    Stream {
+        report_type: &'static str,
+        detail: String,
+    },
+}
+
 /// Errors that can occur in the Interactive Brokers adapter.
 #[derive(Error, Debug)]
 pub enum InteractiveBrokersError {

@@ -239,6 +239,10 @@ impl ExecutionClient for LiveExecutionClient {
         self.client.borrow_mut().disconnect().await
     }
 
+    fn preview_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        self.client.borrow().preview_order(cmd)
+    }
+
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         self.client.borrow().submit_order(cmd)
     }

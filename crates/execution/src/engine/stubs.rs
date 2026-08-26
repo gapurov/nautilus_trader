@@ -58,6 +58,7 @@ pub struct StubExecutionClient {
     stop_count: Rc<Cell<usize>>,
     reset_count: Rc<Cell<usize>>,
     dispose_count: Rc<Cell<usize>>,
+    previewed_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
     submitted_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
     modified_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
     queried_account_ids: Rc<RefCell<Vec<AccountId>>>,
@@ -90,6 +91,7 @@ impl StubExecutionClient {
             stop_count: Rc::new(Cell::new(0)),
             reset_count: Rc::new(Cell::new(0)),
             dispose_count: Rc::new(Cell::new(0)),
+            previewed_order_ids: Rc::new(RefCell::new(Vec::new())),
             submitted_order_ids: Rc::new(RefCell::new(Vec::new())),
             modified_order_ids: Rc::new(RefCell::new(Vec::new())),
             queried_account_ids: Rc::new(RefCell::new(Vec::new())),
@@ -138,6 +140,12 @@ impl StubExecutionClient {
     #[must_use]
     pub fn submitted_order_ids(&self) -> Rc<RefCell<Vec<ClientOrderId>>> {
         self.submitted_order_ids.clone()
+    }
+
+    /// Returns a shared handle to the previewed order IDs.
+    #[must_use]
+    pub fn previewed_order_ids(&self) -> Rc<RefCell<Vec<ClientOrderId>>> {
+        self.previewed_order_ids.clone()
     }
 
     /// Returns a shared handle to the modified order IDs.
@@ -237,6 +245,13 @@ impl ExecutionClient for StubExecutionClient {
 
     fn dispose(&mut self) -> anyhow::Result<()> {
         self.dispose_count.set(self.dispose_count.get() + 1);
+        Ok(())
+    }
+
+    fn preview_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        self.previewed_order_ids
+            .borrow_mut()
+            .push(cmd.client_order_id);
         Ok(())
     }
 

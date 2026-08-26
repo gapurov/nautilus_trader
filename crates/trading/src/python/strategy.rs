@@ -1876,6 +1876,25 @@ impl PyStrategy {
         DataActorNative::core_mut(&mut inner.core).register_indicator_for_bars(bar_type, indicator);
     }
 
+    /// Requests a non-mutating broker diagnostic for a proposed order.
+    #[pyo3(name = "request_order_preview")]
+    #[pyo3(signature = (order, client_id=None, params=None))]
+    fn py_request_order_preview(
+        &mut self,
+        py: Python<'_>,
+        order: Py<PyAny>,
+        client_id: Option<ClientId>,
+        params: Option<Py<PyDict>>,
+    ) -> PyResult<()> {
+        let order = pyobject_to_order_any(py, order)?;
+        let params_map = match params {
+            Some(dict) => from_pydict(py, &dict)?,
+            None => None,
+        };
+        Strategy::request_order_preview(self.inner_mut(), order, client_id, params_map)
+            .map_err(to_pyruntime_err)
+    }
+
     #[pyo3(name = "submit_order")]
     #[pyo3(signature = (order, position_id=None, client_id=None, params=None))]
     fn py_submit_order(

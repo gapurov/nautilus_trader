@@ -140,6 +140,7 @@ pub fn interactive_brokers(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult
     m.add_class::<crate::config::InteractiveBrokersInstrumentProviderConfig>()?;
     m.add_class::<crate::config::DockerizedIBGatewayConfig>()?;
     m.add_class::<crate::config::TradingMode>()?;
+    m.add_class::<crate::data_types::InteractiveBrokersOrderPreview>()?;
     m.add_class::<crate::factories::InteractiveBrokersDataClientFactory>()?;
     m.add_class::<crate::factories::InteractiveBrokersExecutionClientFactory>()?;
     m.add_class::<crate::historical::HistoricalInteractiveBrokersClient>()?;

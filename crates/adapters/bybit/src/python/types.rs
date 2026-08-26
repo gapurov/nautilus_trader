@@ -19,7 +19,44 @@ use pyo3::prelude::*;
 
 use crate::common::types::{
     BybitMarginBorrowResult, BybitMarginRepayResult, BybitMarginStatusResult,
+    BybitOptionCollateralUnavailable,
 };
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl BybitOptionCollateralUnavailable {
+    /// Explicit result when an exact proposed option collateral effect is unavailable.
+    #[new]
+    #[must_use]
+    pub fn py_new(margin_mode: crate::common::enums::BybitMarginMode) -> Self {
+        Self::new(margin_mode)
+    }
+
+    #[getter]
+    #[must_use]
+    pub const fn margin_mode(&self) -> crate::common::enums::BybitMarginMode {
+        self.margin_mode
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn missing_authoritative_inputs(&self) -> Vec<String> {
+        self.missing_authoritative_inputs.clone()
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "BybitOptionCollateralUnavailable(margin_mode={}, missing_authoritative_inputs={:?})",
+            self.margin_mode, self.missing_authoritative_inputs
+        )
+    }
+}
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]

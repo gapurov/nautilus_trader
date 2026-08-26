@@ -932,6 +932,7 @@ pub struct BybitWsAccountWalletCoin {
     #[serde(default, rename = "totalPositionMM")]
     pub total_position_mm: Option<String>,
     pub equity: String,
+    pub usd_value: String,
     #[serde(default, deserialize_with = "deserialize_optional_decimal_or_zero")]
     pub spot_borrow: Decimal,
 }
@@ -944,6 +945,7 @@ pub struct BybitWsAccountWallet {
     pub total_equity: String,
     pub total_available_balance: String,
     pub total_margin_balance: String,
+    pub total_perp_upl: String,
     pub total_initial_margin: String,
     pub total_maintenance_margin: String,
     #[serde(rename = "accountIMRate")]

@@ -36,7 +36,7 @@ use std::{
     time::Duration,
 };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use ibapi::{
     accounts::PositionUpdate,
@@ -53,9 +53,12 @@ use nautilus_common::{
     clients::ExecutionClient,
     enums::LogLevel,
     factories::OrderEventFactory,
-    live::{get_runtime, runner::get_exec_event_sender},
+    live::{
+        get_runtime,
+        runner::{get_data_event_sender, get_exec_event_sender},
+    },
     messages::{
-        ExecutionEvent,
+        DataEvent, ExecutionEvent,
         execution::{
             BatchCancelOrders, CancelAllOrders, CancelOrder, ExecutionReport, GenerateFillReports,
             GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -73,6 +76,7 @@ use nautilus_core::{
 use nautilus_live::{ExecutionClientCore, execution::failure::CommandFailure};
 use nautilus_model::{
     accounts::AccountAny,
+    data::Data,
     enums::{
         LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSideSpecified,
         TimeInForce, TrailingOffsetType,
@@ -109,6 +113,8 @@ use crate::{
         shared_client::SharedClientHandle,
     },
     config::InteractiveBrokersExecClientConfig,
+    data_types::{InteractiveBrokersOrderPreview, register_interactive_brokers_custom_data},
+    error::InteractiveBrokersReconciliationError,
     providers::instruments::InteractiveBrokersInstrumentProvider,
 };
 
@@ -287,6 +293,8 @@ impl InteractiveBrokersExecutionClient {
         if let Some(account_id) = &config.account_id {
             core.account_id = AccountId::from(account_id.clone());
         }
+
+        register_interactive_brokers_custom_data();
 
         Ok(Self {
             core,
@@ -528,6 +536,66 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         self.abort_pending_tasks();
+        Ok(())
+    }
+
+    fn preview_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        let data_sender = get_data_event_sender();
+        let clock = get_atomic_clock_realtime();
+
+        if let Err(reason) = self.ensure_client_ready_for_order_request("preview order") {
+            Self::publish_preview_unavailable(
+                &cmd,
+                self.core.account_id,
+                reason,
+                &data_sender,
+                clock.get_time_ns(),
+            )?;
+            return Ok(());
+        }
+
+        let client = self.ib_client.as_ref().context("IB client not connected")?;
+        let client = Arc::clone(client.as_arc());
+        let venue_order_id_map = Arc::clone(&self.venue_order_id_map);
+        let instrument_id_map = Arc::clone(&self.instrument_id_map);
+        let trader_id_map = Arc::clone(&self.trader_id_map);
+        let strategy_id_map = Arc::clone(&self.strategy_id_map);
+        let next_order_id = Arc::clone(&self.next_order_id);
+        let instrument_provider = Arc::clone(&self.instrument_provider);
+        let order_submit_lock = Arc::clone(&self.order_submit_lock);
+        let account_id = self.core.account_id;
+
+        let handle = get_runtime().spawn(async move {
+            if let Err(e) = Self::handle_preview_order_async(
+                &cmd,
+                &client,
+                &venue_order_id_map,
+                &instrument_id_map,
+                &trader_id_map,
+                &strategy_id_map,
+                &next_order_id,
+                &instrument_provider,
+                account_id,
+                &order_submit_lock,
+            )
+            .await
+                && let Err(send_error) = Self::publish_preview_unavailable(
+                    &cmd,
+                    account_id,
+                    e.to_string(),
+                    &data_sender,
+                    clock.get_time_ns(),
+                )
+            {
+                tracing::error!("Failed to publish unavailable IB order preview: {send_error}");
+            }
+        });
+
+        self.pending_tasks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock pending tasks"))?
+            .push(handle);
+
         Ok(())
     }
 
@@ -843,6 +911,8 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let mut subscription = subscription.filter_data();
         let mut reports = Vec::new();
         let mut open_order_fills: AHashMap<InstrumentId, Decimal> = AHashMap::new();
+        let mut order_data_ids = AHashSet::new();
+        let mut order_status_ids = AHashSet::new();
         let ts_init = get_atomic_clock_realtime().get_time_ns();
         let raw_account_id = raw_ib_account_code(&self.core.account_id);
 
@@ -852,21 +922,19 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     if !data.order.account.is_empty() && data.order.account != raw_account_id {
                         continue;
                     }
+                    order_data_ids.insert(data.order_id);
 
                     // Convert IB contract to instrument ID
                     let instrument_id =
                         match self.resolve_report_contract_instrument_id(&data.contract) {
                             Ok(instrument_id) => instrument_id,
                             Err(e) => {
-                                tracing::warn!(
-                                    order_id = data.order_id,
-                                    sec_type = ?data.contract.security_type,
-                                    symbol = data.contract.symbol.as_str(),
-                                    con_id = data.contract.contract_id,
-                                    error = %e,
-                                    "Failed to resolve IBKR order status report instrument ID",
-                                );
-                                continue;
+                                return Err(anyhow::Error::new(
+                                    InteractiveBrokersReconciliationError::Order {
+                                        order_id: data.order_id,
+                                        detail: e.to_string(),
+                                    },
+                                ));
                             }
                         };
 
@@ -915,24 +983,37 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                             reports.push(report);
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to parse order status report: {e}");
+                            return Err(anyhow::Error::new(
+                                InteractiveBrokersReconciliationError::Order {
+                                    order_id: data.order_id,
+                                    detail: e.to_string(),
+                                },
+                            ));
                         }
                     }
                 }
-                Ok(_) => {
-                    // Ignore other order types
+                Ok(Orders::OrderStatus(status)) => {
+                    order_status_ids.insert(status.order_id);
                 }
                 Err(e) => {
-                    tracing::warn!("Error receiving order data: {e}");
+                    return Err(anyhow::Error::new(
+                        InteractiveBrokersReconciliationError::Stream {
+                            report_type: "order",
+                            detail: e.to_string(),
+                        },
+                    ));
                 }
             }
         }
+
+        Self::ensure_order_statuses_have_data(&order_data_ids, &order_status_ids)?;
 
         if !cmd.open_only {
             let positions = tokio::time::timeout(timeout_dur, client.positions())
                 .await
                 .context("Timeout requesting positions for synthetic order reports")??;
             let mut positions = positions.filter_data();
+            let mut position_end_seen = false;
 
             while let Some(position_result) = positions.next().await {
                 match position_result {
@@ -948,21 +1029,20 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         {
                             Ok(Some(instrument)) => instrument,
                             Ok(None) => {
-                                tracing::warn!(
-                                    con_id = position.contract.contract_id,
-                                    sec_type = ?position.contract.security_type,
-                                    "Cannot generate synthetic order report: instrument not found",
-                                );
-                                continue;
+                                return Err(anyhow::Error::new(
+                                    InteractiveBrokersReconciliationError::Position {
+                                        contract_id: position.contract.contract_id,
+                                        detail: "instrument not found".to_string(),
+                                    },
+                                ));
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    con_id = position.contract.contract_id,
-                                    sec_type = ?position.contract.security_type,
-                                    error = %e,
-                                    "Failed to resolve instrument for synthetic order report",
-                                );
-                                continue;
+                                return Err(anyhow::Error::new(
+                                    InteractiveBrokersReconciliationError::Position {
+                                        contract_id: position.contract.contract_id,
+                                        detail: e.to_string(),
+                                    },
+                                ));
                             }
                         };
 
@@ -974,7 +1054,17 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         }
 
                         let position_qty =
-                            Decimal::from_f64_retain(position.position).unwrap_or_default();
+                            Decimal::from_f64_retain(position.position).ok_or_else(|| {
+                                anyhow::Error::new(
+                                    InteractiveBrokersReconciliationError::Position {
+                                        contract_id: position.contract.contract_id,
+                                        detail: format!(
+                                            "invalid position quantity {}",
+                                            position.position
+                                        ),
+                                    },
+                                )
+                            })?;
                         let open_fills = open_order_fills
                             .get(&instrument_id)
                             .copied()
@@ -984,10 +1074,15 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                             continue;
                         }
 
-                        let quantity = Quantity::new(
-                            adjusted_qty.abs().to_f64().unwrap_or_default(),
-                            instrument.size_precision(),
-                        );
+                        let quantity_value = adjusted_qty.abs().to_f64().ok_or_else(|| {
+                            anyhow::Error::new(InteractiveBrokersReconciliationError::Position {
+                                contract_id: position.contract.contract_id,
+                                detail: format!(
+                                    "position quantity {adjusted_qty} cannot be represented"
+                                ),
+                            })
+                        })?;
+                        let quantity = Quantity::new(quantity_value, instrument.size_precision());
                         let order_side = if adjusted_qty > Decimal::ZERO {
                             OrderSide::Buy
                         } else {
@@ -1010,19 +1105,38 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                             ts_init,
                             Some(UUID4::new()),
                         );
-                        report.avg_px = self.position_avg_px_open(
-                            &instrument_id,
-                            &instrument,
-                            position.average_cost,
-                        );
+                        report.avg_px = self
+                            .position_avg_px_open(
+                                &instrument_id,
+                                &instrument,
+                                position.average_cost,
+                            )
+                            .map_err(|e| {
+                                anyhow::Error::new(
+                                    InteractiveBrokersReconciliationError::Position {
+                                        contract_id: position.contract.contract_id,
+                                        detail: e.to_string(),
+                                    },
+                                )
+                            })?;
                         reports.push(report);
                     }
-                    Ok(PositionUpdate::PositionEnd) => break,
-                    Err(e) => tracing::warn!(
-                        "Error receiving position data for synthetic order report: {e}"
-                    ),
+                    Ok(PositionUpdate::PositionEnd) => {
+                        position_end_seen = true;
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::new(
+                            InteractiveBrokersReconciliationError::Stream {
+                                report_type: "position",
+                                detail: e.to_string(),
+                            },
+                        ));
+                    }
                 }
             }
+
+            Self::ensure_position_snapshot_complete(position_end_seen)?;
         }
 
         Ok(reports)
@@ -1080,7 +1194,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                             commission,
                             &commission_currency,
                             ts_init,
-                        ) {
+                        )? {
                             reports.push(report);
                         }
                     } else {
@@ -1095,7 +1209,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                             commission.commission,
                             &commission.currency,
                             ts_init,
-                        ) {
+                        )? {
                             reports.push(report);
                         }
                     } else {
@@ -1106,17 +1220,20 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Error receiving execution data: {e}");
+                    return Err(anyhow::Error::new(
+                        InteractiveBrokersReconciliationError::Stream {
+                            report_type: "fill",
+                            detail: e.to_string(),
+                        },
+                    ));
                 }
             }
         }
 
-        if !pending_exec_data.is_empty() {
-            tracing::warn!(
-                "Skipped {} historical fill reports because IB did not provide matching commission reports",
-                pending_exec_data.len()
-            );
-        }
+        Self::ensure_historical_commission_pairs_complete(
+            &pending_exec_data,
+            &pending_commissions,
+        )?;
 
         Ok(reports)
     }
@@ -1135,6 +1252,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let mut reports = Vec::new();
         let ts_init = get_atomic_clock_realtime().get_time_ns();
         let raw_account_id = raw_ib_account_code(&self.core.account_id);
+        let mut position_end_seen = false;
 
         // Process positions until PositionEnd; return empty list when none (reconciliation parity:
         // never return None/missing for "no positions").
@@ -1153,24 +1271,32 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     {
                         Ok(Some(instrument)) => instrument,
                         Ok(None) => {
-                            tracing::warn!(
-                                con_id = position.contract.contract_id,
-                                sec_type = ?position.contract.security_type,
-                                "Cannot generate position status report: instrument not found",
-                            );
-                            continue;
+                            return Err(anyhow::Error::new(
+                                InteractiveBrokersReconciliationError::Position {
+                                    contract_id: position.contract.contract_id,
+                                    detail: "instrument not found".to_string(),
+                                },
+                            ));
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                con_id = position.contract.contract_id,
-                                sec_type = ?position.contract.security_type,
-                                error = %e,
-                                "Failed to resolve position instrument",
-                            );
-                            continue;
+                            return Err(anyhow::Error::new(
+                                InteractiveBrokersReconciliationError::Position {
+                                    contract_id: position.contract.contract_id,
+                                    detail: e.to_string(),
+                                },
+                            ));
                         }
                     };
                     let instrument_id = instrument.id();
+
+                    if !position.position.is_finite() {
+                        return Err(anyhow::Error::new(
+                            InteractiveBrokersReconciliationError::Position {
+                                contract_id: position.contract.contract_id,
+                                detail: format!("invalid position quantity {}", position.position),
+                            },
+                        ));
+                    }
 
                     // Filter by instrument_id if specified
                     if let Some(filter_id) = cmd.instrument_id
@@ -1193,11 +1319,14 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
                     // Convert IB avg_cost to Nautilus Price, accounting for price magnifier and multiplier
                     // Python: converted_avg_cost = avg_cost / (multiplier * price_magnifier)
-                    let avg_px_open = self.position_avg_px_open(
-                        &instrument_id,
-                        &instrument,
-                        position.average_cost,
-                    );
+                    let avg_px_open = self
+                        .position_avg_px_open(&instrument_id, &instrument, position.average_cost)
+                        .map_err(|e| {
+                            anyhow::Error::new(InteractiveBrokersReconciliationError::Position {
+                                contract_id: position.contract.contract_id,
+                                detail: e.to_string(),
+                            })
+                        })?;
 
                     let report = PositionStatusReport::new(
                         self.core.account_id,
@@ -1214,14 +1343,21 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     reports.push(report);
                 }
                 Ok(PositionUpdate::PositionEnd) => {
-                    // End of position list
+                    position_end_seen = true;
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!("Error receiving position data: {e}");
+                    return Err(anyhow::Error::new(
+                        InteractiveBrokersReconciliationError::Stream {
+                            report_type: "position",
+                            detail: e.to_string(),
+                        },
+                    ));
                 }
             }
         }
+
+        Self::ensure_position_snapshot_complete(position_end_seen)?;
 
         if reports.is_empty()
             && let Some(instrument_id) = cmd.instrument_id
@@ -1814,6 +1950,33 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 }
 
 impl InteractiveBrokersExecutionClient {
+    fn ensure_order_statuses_have_data(
+        order_data_ids: &AHashSet<i32>,
+        order_status_ids: &AHashSet<i32>,
+    ) -> anyhow::Result<()> {
+        if let Some(order_id) = order_status_ids.difference(order_data_ids).copied().min() {
+            return Err(anyhow::Error::new(
+                InteractiveBrokersReconciliationError::Order {
+                    order_id,
+                    detail: "order status had no matching order data".to_string(),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_position_snapshot_complete(position_end_seen: bool) -> anyhow::Result<()> {
+        if !position_end_seen {
+            return Err(anyhow::Error::new(
+                InteractiveBrokersReconciliationError::Stream {
+                    report_type: "position",
+                    detail: "stream ended before PositionEnd".to_string(),
+                },
+            ));
+        }
+        Ok(())
+    }
+
     fn is_ready_for_order_request(&self) -> bool {
         if !self.is_connected.load(Ordering::Relaxed) {
             return false;
@@ -1947,6 +2110,35 @@ impl InteractiveBrokersExecutionClient {
 
 #[allow(dead_code)]
 impl InteractiveBrokersExecutionClient {
+    fn ensure_historical_commission_pairs_complete(
+        pending_exec_data: &AHashMap<String, ExecutionData>,
+        pending_commissions: &AHashMap<String, (f64, String)>,
+    ) -> anyhow::Result<()> {
+        if !pending_exec_data.is_empty() {
+            let mut execution_ids: Vec<_> = pending_exec_data.keys().cloned().collect();
+            execution_ids.sort();
+            return Err(anyhow::Error::new(
+                InteractiveBrokersReconciliationError::Commission {
+                    execution_ids,
+                    detail: "matching commission reports were not provided".to_string(),
+                },
+            ));
+        }
+
+        if !pending_commissions.is_empty() {
+            let mut execution_ids: Vec<_> = pending_commissions.keys().cloned().collect();
+            execution_ids.sort();
+            return Err(anyhow::Error::new(
+                InteractiveBrokersReconciliationError::Commission {
+                    execution_ids,
+                    detail: "matching execution reports were not provided".to_string(),
+                },
+            ));
+        }
+
+        Ok(())
+    }
+
     fn parse_historical_fill_report(
         &self,
         cmd: &GenerateFillReports,
@@ -1954,40 +2146,49 @@ impl InteractiveBrokersExecutionClient {
         commission: f64,
         commission_currency: &str,
         ts_init: UnixNanos,
-    ) -> Option<FillReport> {
-        let instrument_id = match self.resolve_historical_execution_instrument_id(exec_data) {
-            Ok(instrument_id) => instrument_id,
-            Err(e) => {
-                Self::warn_historical_fill_report_parse_error(exec_data, &e);
-                return None;
-            }
+    ) -> anyhow::Result<Option<FillReport>> {
+        let execution_id = exec_data.execution.execution_id.clone();
+        let fill_error = |detail: String| {
+            anyhow::Error::new(InteractiveBrokersReconciliationError::Fill {
+                execution_id: execution_id.clone(),
+                detail,
+            })
         };
+        let instrument_id = self
+            .resolve_historical_execution_instrument_id(exec_data)
+            .map_err(|e| fill_error(e.to_string()))?;
 
         if let Some(filter_id) = cmd.instrument_id
             && instrument_id != filter_id
         {
-            return None;
+            return Ok(None);
         }
 
         if let Some(filter_venue_order_id) = cmd.venue_order_id
             && ib_venue_order_id(exec_data.execution.order_id, exec_data.execution.perm_id)
                 != filter_venue_order_id
         {
-            return None;
+            return Ok(None);
+        }
+
+        if !commission.is_finite() || commission == -1.0 {
+            return Err(fill_error(format!(
+                "commission is unresolved: {commission}"
+            )));
+        }
+        if commission_currency.is_empty() {
+            return Err(fill_error("commission currency is empty".to_string()));
         }
 
         if let Some(end) = cmd.end {
             match parse_execution_time(&exec_data.execution.time) {
-                Ok(ts_event) if ts_event > end => return None,
+                Ok(ts_event) if ts_event > end => return Ok(None),
                 Ok(_) => {}
-                Err(e) => {
-                    Self::warn_historical_fill_report_parse_error(exec_data, &e);
-                    return None;
-                }
+                Err(e) => return Err(fill_error(e.to_string())),
             }
         }
 
-        match parse_execution_to_fill_report(
+        parse_execution_to_fill_report(
             &exec_data.execution,
             &exec_data.contract,
             commission,
@@ -1997,13 +2198,9 @@ impl InteractiveBrokersExecutionClient {
             &self.instrument_provider,
             ts_init,
             None, // avg_px (not available in historical fills)
-        ) {
-            Ok(report) => Some(report),
-            Err(e) => {
-                Self::warn_historical_fill_report_parse_error(exec_data, &e);
-                None
-            }
-        }
+        )
+        .map(Some)
+        .map_err(|e| fill_error(e.to_string()))
     }
 
     fn resolve_historical_execution_instrument_id(
@@ -2039,32 +2236,26 @@ impl InteractiveBrokersExecutionClient {
         instrument_id: &InstrumentId,
         instrument: &InstrumentAny,
         average_cost: f64,
-    ) -> Option<Decimal> {
+    ) -> anyhow::Result<Option<Decimal>> {
         if average_cost <= 0.0 {
-            return None;
+            return Ok(None);
         }
 
         let price_magnifier = self.instrument_provider.get_price_magnifier(instrument_id) as f64;
         let multiplier = instrument.multiplier().as_f64();
-        let converted_avg_cost = average_cost / (multiplier * price_magnifier);
-        Decimal::from_f64_retain(converted_avg_cost)
-            .map(|price| price.round_dp(instrument.price_precision() as u32))
-    }
-
-    fn warn_historical_fill_report_parse_error(exec_data: &ExecutionData, error: &anyhow::Error) {
-        tracing::warn!(
-            symbol = exec_data.contract.symbol.as_str(),
-            sec_type = ?exec_data.contract.security_type,
-            exchange = exec_data.contract.exchange.as_str(),
-            primary_exchange = exec_data.contract.primary_exchange.as_str(),
-            local_symbol = exec_data.contract.local_symbol.as_str(),
-            con_id = exec_data.contract.contract_id,
-            order_id = exec_data.execution.order_id,
-            order_ref = exec_data.execution.order_reference.as_str(),
-            execution_id = exec_data.execution.execution_id.as_str(),
-            error = %error,
-            "Failed to parse IBKR historical fill report",
+        anyhow::ensure!(
+            price_magnifier.is_finite() && price_magnifier > 0.0,
+            "invalid price magnifier {price_magnifier}"
         );
+        anyhow::ensure!(
+            multiplier.is_finite() && multiplier > 0.0,
+            "invalid instrument multiplier {multiplier}"
+        );
+        let converted_avg_cost = average_cost / (multiplier * price_magnifier);
+        let price = Decimal::from_f64_retain(converted_avg_cost).ok_or_else(|| {
+            anyhow::anyhow!("average cost {average_cost} cannot be represented as Decimal")
+        })?;
+        Ok(Some(price.round_dp(instrument.price_precision() as u32)))
     }
 
     fn validate_cancel_order_target(

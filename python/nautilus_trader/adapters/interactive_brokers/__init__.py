@@ -30,6 +30,7 @@ __all__ = [
     "InteractiveBrokersExecutionClientFactory",
     "InteractiveBrokersInstrumentProvider",
     "InteractiveBrokersInstrumentProviderConfig",
+    "InteractiveBrokersOrderPreview",
 ]
 
 fixup_module_names(globals(), __name__)

@@ -158,6 +158,18 @@ pub trait ExecutionClient {
         Ok(())
     }
 
+    /// Requests a non-mutating broker diagnostic for a proposed order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the execution client does not support order previews.
+    fn preview_order(&self, _cmd: SubmitOrder) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Order preview is not supported by execution client {}",
+            self.client_id()
+        )
+    }
+
     /// Submits a single order command to the execution venue.
     ///
     /// # Errors
