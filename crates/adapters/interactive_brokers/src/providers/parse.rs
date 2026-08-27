@@ -19,7 +19,8 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use ibapi::contracts::SecurityType;
-use nautilus_core::{UnixNanos, time::get_atomic_clock_realtime};
+use jiff::{civil::DateTime, tz::AmbiguousOffset};
+use nautilus_core::{UnixNanos, datetime::get_timezone, time::get_atomic_clock_realtime};
 use nautilus_model::{
     enums::AssetClass,
     identifiers::{InstrumentId, Symbol},
@@ -56,102 +57,99 @@ pub fn tick_size_to_precision(tick_size: f64) -> u8 {
     }
 }
 
-/// Convert timestamp string to UnixNanos.
+/// Converts an IBKR derivative last trade timestamp to [`UnixNanos`].
 ///
-/// Handles formats like "20230101" or "20230101 00:00:00 UTC".
+/// Explicit timestamps use their timezone token, or `ContractDetails.time_zone_id` when omitted.
+/// Date-only values require `ContractDetails.last_trade_time` and `time_zone_id`.
 ///
 /// # Errors
 ///
-/// Returns an error if the timestamp cannot be parsed.
+/// Returns an error if the exact last trade instant cannot be resolved without ambiguity.
 pub fn expiry_timestring_to_unix_nanos(
     expiry: &str,
     details: Option<&ibapi::contracts::ContractDetails>,
 ) -> anyhow::Result<UnixNanos> {
+    let expiry = expiry.trim();
     if expiry.is_empty() {
-        anyhow::bail!("Empty expiry string");
+        anyhow::bail!("IBKR derivative contract is missing its last trade date or timestamp");
     }
 
-    // Parse timestamp string - Most contract expirations are %Y%m%d format
-    // Some exchanges have expirations in %Y%m%d %H:%M:%S %Z
-    let dt = if expiry.len() == 8 {
-        // Format: YYYYMMDD
-        let year = &expiry[0..4];
-        let month = &expiry[4..6];
-        let day = &expiry[6..8];
-        let date = time::Date::from_calendar_date(
-            year.parse()?,
-            time::Month::try_from(month.parse::<u8>()?)?,
-            day.parse()?,
-        )?;
+    let mut parts = expiry.split_whitespace();
+    let Some(date) = parts.next() else {
+        anyhow::bail!("IBKR derivative contract is missing its last trade date or timestamp");
+    };
+    let explicit_time = parts.next();
+    let explicit_timezone = parts.next();
+    if parts.next().is_some() {
+        anyhow::bail!("Invalid IBKR derivative last trade timestamp '{expiry}'");
+    }
 
-        // If we have trading hours, try to extract the last trade time
-        // Trading hours format: "20240411:0000-20240411:1800;..."
-        let mut expiry_time = time::Time::MIDNIGHT;
-
-        if let Some(details) = details {
-            if !details.trading_hours.is_empty()
-                && !details.trading_hours.contains(&"CLOSED".to_string())
-            {
-                // Find the session for this date
-                let expiry_str: &str = expiry;
-                for session in &details.trading_hours {
-                    if session.as_str().starts_with(expiry_str) && session.as_str().contains('-') {
-                        let parts: Vec<&str> = session.as_str().split('-').collect();
-                        if let Some(end_part) = parts.get(1) {
-                            let inner_parts: Vec<&str> = end_part.split(':').collect();
-                            if let Some(time_part) = inner_parts.get(1) {
-                                if time_part.len() >= 4 {
-                                    let hour = time_part
-                                        .get(0..2)
-                                        .and_then(|s: &str| s.parse::<u8>().ok())
-                                        .unwrap_or(0);
-                                    let minute = time_part
-                                        .get(2..4)
-                                        .and_then(|s: &str| s.parse::<u8>().ok())
-                                        .unwrap_or(0);
-                                    expiry_time = time::Time::from_hms(hour, minute, 0)
-                                        .unwrap_or(time::Time::MIDNIGHT);
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        time::PrimitiveDateTime::new(date, expiry_time)
+    let (time, timezone) = if let Some(time) = explicit_time {
+        let timezone = explicit_timezone
+            .or_else(|| {
+                details
+                    .map(|details| details.time_zone_id.trim())
+                    .filter(|timezone| !timezone.is_empty())
+            })
+            .with_context(|| {
+                format!("IBKR derivative timestamp '{expiry}' is missing its timezone")
+            })?;
+        (time, timezone)
     } else {
-        // Format: YYYYMMDD HH:MM:SS TZ
-        let parts: Vec<&str> = expiry.split(' ').collect();
-        if parts.len() >= 3 {
-            let date_part = parts[0];
-            let time_part = parts[1];
-            let year = &date_part[0..4];
-            let month = &date_part[4..6];
-            let day = &date_part[6..8];
+        let details = details.with_context(|| {
+            format!("IBKR derivative last trade date '{date}' has no ContractDetails")
+        })?;
 
-            let time_parts: Vec<&str> = time_part.split(':').collect();
-            let hour = time_parts.first().unwrap_or(&"0").parse::<u8>()?;
-            let minute = time_parts.get(1).unwrap_or(&"0").parse::<u8>()?;
-            let second = time_parts.get(2).unwrap_or(&"0").parse::<u8>()?;
-
-            let date = time::Date::from_calendar_date(
-                year.parse()?,
-                time::Month::try_from(month.parse::<u8>()?)?,
-                day.parse()?,
-            )?;
-            let time_obj = time::Time::from_hms(hour, minute, second)?;
-            time::PrimitiveDateTime::new(date, time_obj)
-        } else {
-            anyhow::bail!("Invalid expiry format: {}", expiry);
+        if date.len() != 8 {
+            let real_expiration_date = details.real_expiration_date.trim();
+            anyhow::bail!(
+                "IBKR derivative last trade value '{date}' is not an exact date; real expiration date was '{real_expiration_date}'"
+            );
         }
+
+        let time = details.last_trade_time.trim();
+        if time.is_empty() {
+            anyhow::bail!(
+                "IBKR derivative last trade date '{date}' is missing ContractDetails.last_trade_time"
+            );
+        }
+
+        let timezone = details.time_zone_id.trim();
+        if timezone.is_empty() {
+            anyhow::bail!(
+                "IBKR derivative last trade date '{date}' is missing ContractDetails.time_zone_id"
+            );
+        }
+        (time, timezone)
     };
 
-    // Treat the parsed expiry timestamp as UTC. NautilusTrader expects IB timestamps
-    // to be configured and interpreted in UTC.
-    let offset_dt = dt.assume_utc();
-    let nanos = offset_dt.unix_timestamp_nanos();
-    Ok(UnixNanos::new(nanos as u64))
+    let format = match time.len() {
+        5 => "%Y%m%d %H:%M",
+        8 => "%Y%m%d %H:%M:%S",
+        _ => anyhow::bail!("Invalid IBKR derivative last trade time '{time}' for date '{date}'"),
+    };
+    let local_label = format!("{date} {time}");
+    let local = DateTime::strptime(format, &local_label)
+        .with_context(|| format!("Invalid IBKR derivative last trade timestamp '{local_label}'"))?;
+    let timezone_name = timezone;
+    let timezone = get_timezone(timezone_name).with_context(|| {
+        format!("Unknown IBKR derivative timezone '{timezone_name}' for '{local_label}'")
+    })?;
+    let ambiguous = timezone.to_ambiguous_timestamp(local);
+    let timestamp = match ambiguous.offset() {
+        AmbiguousOffset::Unambiguous { .. } => ambiguous.unambiguous()?,
+        AmbiguousOffset::Fold { .. } => anyhow::bail!(
+            "IBKR derivative last trade timestamp '{local_label}' is ambiguous in timezone '{timezone_name}'"
+        ),
+        AmbiguousOffset::Gap { .. } => anyhow::bail!(
+            "IBKR derivative last trade timestamp '{local_label}' does not exist in timezone '{timezone_name}'"
+        ),
+    };
+    let nanos = u64::try_from(timestamp.as_nanosecond()).with_context(|| {
+        format!("IBKR derivative last trade timestamp '{local_label}' was before the Unix epoch")
+    })?;
+
+    Ok(UnixNanos::from(nanos))
 }
 
 /// Parse an IB ContractDetails to a Nautilus instrument.
@@ -170,7 +168,7 @@ pub fn parse_ib_contract_to_instrument(
         SecurityType::ForexPair => Ok(parse_forex_contract(details, instrument_id)),
         SecurityType::Crypto => Ok(parse_crypto_contract(details, instrument_id)),
         SecurityType::Future | SecurityType::ContinuousFuture => {
-            Ok(parse_futures_contract(details, instrument_id))
+            parse_futures_contract(details, instrument_id)
         }
         SecurityType::Option => parse_option_contract(details, instrument_id),
         SecurityType::FuturesOption => parse_option_contract(details, instrument_id), // FOP uses same parsing as OPT
@@ -357,25 +355,15 @@ fn parse_contract_multiplier(multiplier: &str, default: f64) -> Quantity {
 fn parse_futures_contract(
     details: &ibapi::contracts::ContractDetails,
     instrument_id: InstrumentId,
-) -> InstrumentAny {
+) -> anyhow::Result<InstrumentAny> {
     let price_precision = tick_size_to_precision(details.min_tick);
     let timestamp = get_atomic_clock_realtime().get_time_ns();
 
-    // Parse expiration
-    let expiration_ns = if !details
-        .contract
-        .last_trade_date_or_contract_month
-        .is_empty()
-    {
-        expiry_timestring_to_unix_nanos(
-            &details.contract.last_trade_date_or_contract_month,
-            Some(details),
-        )
-        .unwrap_or_else(|_| UnixNanos::from(timestamp.as_u64() + 90 * 24 * 60 * 60 * 1_000_000_000))
-    // Default to +90 days on error
-    } else {
-        UnixNanos::from(timestamp.as_u64() + 90 * 24 * 60 * 60 * 1_000_000_000) // Default to +90 days if empty
-    };
+    let expiration_ns = expiry_timestring_to_unix_nanos(
+        &details.contract.last_trade_date_or_contract_month,
+        Some(details),
+    )
+    .context("Failed to resolve IBKR futures contract expiration")?;
 
     let ninety_days_ns: u64 = 90 * 24 * 60 * 60 * 1_000_000_000;
     let activation_ns = expiration_ns
@@ -421,7 +409,7 @@ fn parse_futures_contract(
         timestamp,
     );
 
-    InstrumentAny::from(instrument)
+    Ok(InstrumentAny::from(instrument))
 }
 
 /// Parse option contract (OPT).
@@ -432,21 +420,11 @@ fn parse_option_contract(
     let price_precision = tick_size_to_precision(details.min_tick);
     let timestamp = get_atomic_clock_realtime().get_time_ns();
 
-    // Parse expiration
-    let expiration_ns = if !details
-        .contract
-        .last_trade_date_or_contract_month
-        .is_empty()
-    {
-        expiry_timestring_to_unix_nanos(
-            &details.contract.last_trade_date_or_contract_month,
-            Some(details),
-        )
-        .unwrap_or_else(|_| UnixNanos::from(timestamp.as_u64() + 90 * 24 * 60 * 60 * 1_000_000_000))
-    // Default to +90 days on error
-    } else {
-        UnixNanos::from(timestamp.as_u64() + 90 * 24 * 60 * 60 * 1_000_000_000) // Default to +90 days if empty
-    };
+    let expiration_ns = expiry_timestring_to_unix_nanos(
+        &details.contract.last_trade_date_or_contract_month,
+        Some(details),
+    )
+    .context("Failed to resolve IBKR option contract expiration")?;
 
     let ninety_days_ns: u64 = 90 * 24 * 60 * 60 * 1_000_000_000;
     let activation_ns = expiration_ns
@@ -509,6 +487,7 @@ mod tests {
     use ibapi::contracts::{
         Contract, ContractDetails, Currency, Exchange, OptionRight, SecurityType, Symbol,
     };
+    use nautilus_core::UnixNanos;
     use nautilus_model::{
         enums::AssetClass,
         identifiers::{InstrumentId, Symbol as NautilusSymbol, Venue},
@@ -519,9 +498,78 @@ mod tests {
     use ustr::Ustr;
 
     use super::{
-        parse_contract_multiplier, parse_ib_contract_to_instrument,
-        parse_option_spread_instrument_id,
+        expiry_timestring_to_unix_nanos, parse_contract_multiplier,
+        parse_ib_contract_to_instrument, parse_option_spread_instrument_id,
     };
+
+    fn derivative_expiration_details(
+        real_expiration_date: &str,
+        last_trade_time: &str,
+        time_zone_id: &str,
+    ) -> ContractDetails {
+        ContractDetails {
+            real_expiration_date: real_expiration_date.to_string(),
+            last_trade_time: last_trade_time.to_string(),
+            time_zone_id: time_zone_id.to_string(),
+            trading_hours: vec!["20261127:CLOSED".to_string()],
+            liquid_hours: vec!["20261127:CLOSED".to_string()],
+            ..Default::default()
+        }
+    }
+
+    #[rstest]
+    #[case(
+        "20260717",
+        "20260717",
+        "16:00:00",
+        "US/Eastern",
+        1_784_318_400_000_000_000
+    )]
+    #[case(
+        "20261127",
+        "20261127",
+        "13:00:00",
+        "US/Eastern",
+        1_795_802_400_000_000_000
+    )]
+    #[case("20261127 13:00:00 US/Eastern", "", "", "", 1_795_802_400_000_000_000)]
+    #[case(
+        "20260319",
+        "20260320",
+        "17:00",
+        "US/Eastern",
+        1_773_954_000_000_000_000
+    )]
+    fn test_parse_derivative_expiration_uses_authoritative_fields(
+        #[case] expiry: &str,
+        #[case] real_expiration_date: &str,
+        #[case] last_trade_time: &str,
+        #[case] time_zone_id: &str,
+        #[case] expected_ns: u64,
+    ) {
+        let details =
+            derivative_expiration_details(real_expiration_date, last_trade_time, time_zone_id);
+        let result = expiry_timestring_to_unix_nanos(expiry, Some(&details)).unwrap();
+
+        assert_eq!(result, UnixNanos::from(expected_ns));
+    }
+
+    #[rstest]
+    #[case("20260717", "", "US/Eastern", "last_trade_time")]
+    #[case("20260717", "16:00:00", "", "time_zone_id")]
+    #[case("20260717", "25:00:00", "US/Eastern", "Invalid IBKR derivative")]
+    #[case("20261101", "01:30:00", "US/Eastern", "ambiguous")]
+    fn test_parse_derivative_expiration_rejects_inexact_facts(
+        #[case] expiry: &str,
+        #[case] last_trade_time: &str,
+        #[case] time_zone_id: &str,
+        #[case] expected_error: &str,
+    ) {
+        let details = derivative_expiration_details(expiry, last_trade_time, time_zone_id);
+        let error = expiry_timestring_to_unix_nanos(expiry, Some(&details)).unwrap_err();
+
+        assert!(error.to_string().contains(expected_error));
+    }
 
     #[rstest]
     fn test_parse_option_contract_prefixes_index_underlying() {
@@ -541,6 +589,9 @@ mod tests {
             min_tick: 0.05,
             under_symbol: "SPX".to_string(),
             under_security_type: "IND".to_string(),
+            real_expiration_date: "20260313".to_string(),
+            last_trade_time: "16:00:00".to_string(),
+            time_zone_id: "US/Eastern".to_string(),
             ..Default::default()
         };
         let instrument_id = InstrumentId::new(
@@ -555,6 +606,10 @@ mod tests {
         };
 
         assert_eq!(option.asset_class(), AssetClass::Index);
+        assert_eq!(
+            option.expiration_ns(),
+            Some(UnixNanos::from(1_773_432_000_000_000_000))
+        );
         assert_eq!(option.underlying(), Some(Ustr::from("^SPX")));
     }
 
@@ -610,12 +665,16 @@ mod tests {
                 exchange: Exchange::from("CME"),
                 currency: Currency::from("USD"),
                 local_symbol: String::new(),
+                last_trade_date_or_contract_month: "20260320".to_string(),
                 multiplier: "50".to_string(),
                 ..Default::default()
             },
             min_tick: 0.25,
             under_symbol: "ES".to_string(),
             under_security_type: "IND".to_string(),
+            real_expiration_date: "20260320".to_string(),
+            last_trade_time: "16:00:00".to_string(),
+            time_zone_id: "US/Central".to_string(),
             ..Default::default()
         };
         let instrument_id = InstrumentId::new(NautilusSymbol::from("ES"), Venue::from("CME"));

@@ -1963,8 +1963,8 @@ impl InteractiveBrokersInstrumentProvider {
 
         let mut total_loaded = 0;
 
-        // Get current time for expiry day calculation
-        let now = nautilus_core::time::get_atomic_clock_realtime().get_time_ns();
+        let config_expiry_min = expiry_bound_from_days(self.config.min_expiry_days);
+        let config_expiry_max = expiry_bound_from_days(self.config.max_expiry_days);
 
         // Collect all expirations from the metadata
         let mut all_expirations = Vec::new();
@@ -1991,29 +1991,15 @@ impl InteractiveBrokersInstrumentProvider {
                             (None, None) => true,
                         };
 
-                        // Filter by expiry days from config if specified
-                        let days_filter_pass = {
-                            let expiry_ns =
-                                crate::providers::parse::expiry_timestring_to_unix_nanos(
-                                    expiration.as_str(),
-                                    None,
-                                )
-                                .unwrap_or(now);
-                            let days_until_expiry =
-                                (expiry_ns.as_u64().saturating_sub(now.as_u64()))
-                                    / (24 * 60 * 60 * 1_000_000_000);
-
-                            let min_days_ok = self
-                                .config
-                                .min_expiry_days
-                                .is_none_or(|min| days_until_expiry >= min as u64);
-                            let max_days_ok = self
-                                .config
-                                .max_expiry_days
-                                .is_none_or(|max| days_until_expiry <= max as u64);
-
-                            min_days_ok && max_days_ok
-                        };
+                        let days_filter_pass =
+                            match (config_expiry_min.as_deref(), config_expiry_max.as_deref()) {
+                                (Some(min), Some(max)) => {
+                                    expiration.as_str() >= min && expiration.as_str() <= max
+                                }
+                                (Some(min), None) => expiration.as_str() >= min,
+                                (None, Some(max)) => expiration.as_str() <= max,
+                                (None, None) => true,
+                            };
 
                         if date_filter_pass
                             && days_filter_pass
@@ -2831,6 +2817,9 @@ mod tests {
             under_symbol: "AAPL".to_string(),
             under_security_type: "STK".to_string(),
             valid_exchanges: vec!["SMART".to_string(), "CBOE".to_string()],
+            real_expiration_date: "20270115".to_string(),
+            last_trade_time: "16:00:00".to_string(),
+            time_zone_id: "US/Eastern".to_string(),
             ..Default::default()
         }
     }
