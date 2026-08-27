@@ -48,12 +48,13 @@ use super::{
     },
 };
 use crate::common::{
-    enums::{BybitOrderStatus, BybitPositionSide, BybitTimeInForce},
+    enums::{BybitMarginMode, BybitOrderStatus, BybitPositionSide, BybitTimeInForce},
     parse::{
-        bybit_rejection_due_post_only, get_currency, make_hedge_venue_position_id,
-        parse_book_level, parse_bybit_order_type, parse_millis_timestamp,
-        parse_price_with_precision, parse_quantity_with_precision,
+        BybitAccountStateInfo, bybit_rejection_due_post_only, get_currency,
+        make_hedge_venue_position_id, parse_book_level, parse_bybit_order_type,
+        parse_millis_timestamp, parse_price_with_precision, parse_quantity_with_precision,
     },
+    types::BybitAccountCoinInfo,
 };
 
 /// Classifies a parsed JSON value into a typed Bybit WebSocket frame.
@@ -1071,6 +1072,7 @@ pub fn parse_ws_position_status_report(
 /// Returns an error if balance fields cannot be parsed.
 pub fn parse_ws_account_state(
     wallet: &BybitWsAccountWallet,
+    margin_mode: BybitMarginMode,
     account_id: AccountId,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
@@ -1104,6 +1106,32 @@ pub fn parse_ws_account_state(
         }
     }
 
+    let info = BybitAccountStateInfo {
+        account_type: "UNIFIED",
+        margin_mode,
+        total_wallet_balance: &wallet.total_wallet_balance,
+        total_equity: &wallet.total_equity,
+        total_available_balance: &wallet.total_available_balance,
+        total_margin_balance: &wallet.total_margin_balance,
+        total_initial_margin: &wallet.total_initial_margin,
+        total_maintenance_margin: &wallet.total_maintenance_margin,
+        total_perp_upl: &wallet.total_perp_upl,
+        account_im_rate: &wallet.account_im_rate,
+        account_mm_rate: &wallet.account_mm_rate,
+        account_ltv: &wallet.account_ltv,
+        coins: wallet
+            .coin
+            .iter()
+            .map(|coin| BybitAccountCoinInfo {
+                coin: coin.coin.to_string(),
+                wallet_balance: coin.wallet_balance.to_string(),
+                equity: coin.equity.clone(),
+                usd_value: coin.usd_value.clone(),
+            })
+            .collect(),
+    }
+    .into_params()?;
+
     Ok(AccountState::new(
         account_id,
         AccountType::Margin, // Bybit unified account
@@ -1114,7 +1142,8 @@ pub fn parse_ws_account_state(
         ts_event,
         ts_init,
         None, // base_currency
-    ))
+    )
+    .with_info(Some(info)))
 }
 
 #[cfg(test)]
@@ -1755,7 +1784,14 @@ mod tests {
         let account_id = AccountId::new("BYBIT-001");
         let ts_event = UnixNanos::new(1_700_034_722_104_000_000);
 
-        let state = parse_ws_account_state(wallet, account_id, ts_event, TS).unwrap();
+        let state = parse_ws_account_state(
+            wallet,
+            BybitMarginMode::RegularMargin,
+            account_id,
+            ts_event,
+            TS,
+        )
+        .unwrap();
 
         assert_eq!(state.account_id, account_id);
         assert_eq!(state.account_type, AccountType::Margin);
@@ -1779,6 +1815,18 @@ mod tests {
         // BTC has order IM only (no position), USDT has position IM+MM (no orders).
         assert_eq!(state.margins.len(), 2);
         assert!(state.margins.iter().all(|m| m.instrument_id.is_none()));
+
+        let info = state.info.as_ref().expect("account info missing");
+        assert_eq!(info["account_type"], "UNIFIED");
+        assert_eq!(info["margin_mode"], "REGULAR_MARGIN");
+        assert_eq!(info["total_available_balance"], "9556.6056555");
+        assert_eq!(info["total_equity"], "10262.91335023");
+        assert_eq!(info["total_initial_margin"], "127.8573161");
+        assert_eq!(info["total_maintenance_margin"], "12.78573161");
+        assert_eq!(info["coins"]["USDT"]["wallet_balance"], "9647.75537647");
+        assert_eq!(info["coins"]["USDT"]["equity"], "10226.20575506");
+        assert_eq!(info["coins"]["USDT"]["usd_value"], "10226.20575506");
+        assert_eq!(info["usdt_to_account_usd_rate"], "1");
 
         let btc_margin = state
             .margins
@@ -1812,7 +1860,14 @@ mod tests {
         let account_id = AccountId::new("BYBIT-UNIFIED");
         let ts_event = UnixNanos::new(1_762_960_669_000_000_000);
 
-        let state = parse_ws_account_state(wallet, account_id, ts_event, TS).unwrap();
+        let state = parse_ws_account_state(
+            wallet,
+            BybitMarginMode::RegularMargin,
+            account_id,
+            ts_event,
+            TS,
+        )
+        .unwrap();
 
         assert_eq!(state.account_id, account_id);
         assert_eq!(state.balances.len(), 1);
@@ -2075,7 +2130,14 @@ mod tests {
         let account_id = AccountId::new("BYBIT-UNIFIED");
         let ts_event = UnixNanos::new(1_762_960_669_000_000_000);
 
-        let state = parse_ws_account_state(wallet, account_id, ts_event, TS).unwrap();
+        let state = parse_ws_account_state(
+            wallet,
+            BybitMarginMode::RegularMargin,
+            account_id,
+            ts_event,
+            TS,
+        )
+        .unwrap();
 
         let usdt_balance = &state.balances[0];
         assert_eq!(usdt_balance.currency.code.as_str(), "USDT");

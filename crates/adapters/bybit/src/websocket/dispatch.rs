@@ -21,7 +21,7 @@
 //! downstream reconciliation.
 
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -57,7 +57,7 @@ use super::{
 };
 use crate::{
     common::{
-        enums::{BybitOrderSide, BybitOrderStatus, BybitProductType},
+        enums::{BybitMarginMode, BybitOrderSide, BybitOrderStatus, BybitProductType},
         parse::{
             bybit_rejection_due_post_only, get_currency, make_bybit_symbol, parse_millis_timestamp,
             parse_price_with_precision, parse_quantity_with_precision,
@@ -129,6 +129,7 @@ pub struct WsDispatchState {
     pub filled_orders: DashSet<ClientOrderId>,
     spot_repay_fills: DashMap<ClientOrderId, SpotRepayFill>,
     repay_tx: ArcSwapOption<tokio::sync::mpsc::UnboundedSender<RepayRequest>>,
+    margin_mode: RwLock<Option<BybitMarginMode>>,
     clearing: AtomicBool,
 }
 
@@ -143,12 +144,28 @@ impl Default for WsDispatchState {
             filled_orders: DashSet::default(),
             spot_repay_fills: DashMap::new(),
             repay_tx: ArcSwapOption::empty(),
+            margin_mode: RwLock::new(None),
             clearing: AtomicBool::new(false),
         }
     }
 }
 
 impl WsDispatchState {
+    pub fn set_margin_mode(&self, margin_mode: BybitMarginMode) -> anyhow::Result<()> {
+        *self
+            .margin_mode
+            .write()
+            .map_err(|_| anyhow::anyhow!("Bybit margin mode lock poisoned"))? = Some(margin_mode);
+        Ok(())
+    }
+
+    pub fn margin_mode(&self) -> anyhow::Result<BybitMarginMode> {
+        self.margin_mode
+            .read()
+            .map_err(|_| anyhow::anyhow!("Bybit margin mode lock poisoned"))?
+            .ok_or_else(|| anyhow::anyhow!("Bybit margin mode has not been verified"))
+    }
+
     fn evict_if_full(&self, set: &DashSet<ClientOrderId>) {
         if set.len() >= DEDUP_CAPACITY
             && self
@@ -251,9 +268,16 @@ pub fn dispatch_ws_message(
                     log::warn!("Failed to parse wallet creation_time, using ts_init: {e}");
                     ts_init
                 });
+            let margin_mode = match state.margin_mode() {
+                Ok(margin_mode) => margin_mode,
+                Err(e) => {
+                    log::error!("Cannot publish Bybit account state: {e}");
+                    return;
+                }
+            };
 
             for wallet in &msg.data {
-                match parse_ws_account_state(wallet, account_id, ts_event, ts_init) {
+                match parse_ws_account_state(wallet, margin_mode, account_id, ts_event, ts_init) {
                     Ok(state) => emitter.send_account_state(state),
                     Err(e) => log::error!("Failed to parse account state: {e}"),
                 }
@@ -1817,6 +1841,9 @@ mod tests {
         let (emitter, mut rx) = create_emitter();
         let clock = get_atomic_clock_realtime();
         let state = WsDispatchState::default();
+        state
+            .set_margin_mode(crate::common::enums::BybitMarginMode::RegularMargin)
+            .unwrap();
 
         let json = load_test_json("ws_account_wallet.json");
         let msg: crate::websocket::messages::BybitWsAccountWalletMsg =

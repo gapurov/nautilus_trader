@@ -62,8 +62,8 @@ use crate::{
         consts::BYBIT_VENUE,
         credential::credential_env_vars,
         enums::{
-            BybitAccountType, BybitEnvironment, BybitOrderSide, BybitOrderType, BybitPositionIdx,
-            BybitPositionMode, BybitProductType, BybitTimeInForce, BybitTpSlMode,
+            BybitAccountType, BybitEnvironment, BybitMarginMode, BybitOrderSide, BybitOrderType,
+            BybitPositionIdx, BybitPositionMode, BybitProductType, BybitTimeInForce, BybitTpSlMode,
             resolve_trigger_type,
         },
         parse::{
@@ -287,7 +287,7 @@ impl BybitExecutionClient {
         resolve_bybit_position_idx(mode, order_side, is_reduce_only, manual_override)
     }
 
-    async fn apply_account_configuration(&self) -> anyhow::Result<()> {
+    async fn apply_account_configuration(&self) -> anyhow::Result<BybitMarginMode> {
         self.apply_leverages_setting().await;
         self.apply_position_modes_setting().await;
         self.apply_margin_mode_setting().await
@@ -355,28 +355,35 @@ impl BybitExecutionClient {
         }
     }
 
-    async fn apply_margin_mode_setting(&self) -> anyhow::Result<()> {
-        let Some(margin_mode) = self.config.margin_mode else {
-            return Ok(());
-        };
-
-        let result = self.http_client.set_margin_mode(margin_mode).await;
-
-        match result {
-            Ok(_) => {
-                log::info!("Set account margin mode to {margin_mode:?}");
-                Ok(())
+    async fn apply_margin_mode_setting(&self) -> anyhow::Result<BybitMarginMode> {
+        if let Some(margin_mode) = self.config.margin_mode {
+            match self.http_client.set_margin_mode(margin_mode).await {
+                Ok(_) => log::info!("Set account margin mode to {margin_mode:?}"),
+                Err(e) if Self::is_unchanged_error(&e, "") => {
+                    log::debug!("Margin mode already set to {margin_mode:?}");
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::from(e).context("failed to set margin mode"));
+                }
             }
-            Err(e) if Self::is_unchanged_error(&e, "") => {
-                log::debug!("Margin mode already set to {margin_mode:?}");
-                Ok(())
-            }
-            Err(e) if Self::is_low_margin_error(&e) => {
-                log::warn!("Cannot set margin mode: {e}");
-                Ok(())
-            }
-            Err(e) => Err(anyhow::Error::from(e).context("failed to set margin mode")),
         }
+
+        let account_info = self
+            .http_client
+            .get_account_info()
+            .await
+            .context("failed to verify margin mode")?;
+        let actual = account_info.result.margin_mode;
+
+        if let Some(expected) = self.config.margin_mode
+            && actual != expected
+        {
+            anyhow::bail!(
+                "Bybit margin mode verification failed: expected {expected}, was {actual}"
+            );
+        }
+
+        Ok(actual)
     }
 
     fn parse_derivative_symbol(symbol_str: &str) -> Option<BybitSymbol> {
@@ -400,11 +407,6 @@ impl BybitExecutionClient {
             return true;
         }
         !code.is_empty() && msg.contains(code)
-    }
-
-    fn is_low_margin_error<E: std::fmt::Display>(err: &E) -> bool {
-        err.to_string()
-            .contains("needs to be equal to or greater than")
     }
 
     fn map_order_type(order_type: OrderType) -> anyhow::Result<(BybitOrderType, bool)> {
@@ -630,6 +632,9 @@ impl ExecutionClient for BybitExecutionClient {
         self.ws_private.set_account_id(self.core.account_id);
         self.ws_trade.set_account_id(self.core.account_id);
 
+        let margin_mode = self.apply_account_configuration().await?;
+        self.dispatch_state.set_margin_mode(margin_mode)?;
+
         self.ws_private.connect().await?;
         self.ws_private.wait_until_active(10.0).await?;
         log::debug!("Connected to private WebSocket");
@@ -707,8 +712,6 @@ impl ExecutionClient for BybitExecutionClient {
         self.ws_private.subscribe_executions().await?;
         self.ws_private.subscribe_positions().await?;
         self.ws_private.subscribe_wallet().await?;
-
-        self.apply_account_configuration().await?;
 
         let account_state = self
             .http_client
@@ -2833,14 +2836,6 @@ mod tests {
             BybitExecutionClient::is_unchanged_error(&err, code),
             expected
         );
-    }
-
-    #[rstest]
-    #[case::matches("Margin needs to be equal to or greater than 0.5", true)]
-    #[case::no_match("Some other error", false)]
-    fn test_is_low_margin_error(#[case] msg: &str, #[case] expected: bool) {
-        let err = anyhow::anyhow!("{msg}");
-        assert_eq!(BybitExecutionClient::is_low_margin_error(&err), expected);
     }
 
     #[rstest]

@@ -4206,7 +4206,10 @@ impl BybitHttpClient {
             coin: None,
         };
 
-        let response = self.inner.get_wallet_balance(&params).await?;
+        let (response, account_info) = tokio::try_join!(
+            self.inner.get_wallet_balance(&params),
+            self.inner.get_account_info(),
+        )?;
         let ts_init = self.generate_ts_init();
 
         // Take the first wallet balance from the list
@@ -4216,7 +4219,12 @@ impl BybitHttpClient {
             .first()
             .ok_or_else(|| anyhow::anyhow!("No wallet balance found in response"))?;
 
-        parse_account_state(wallet_balance, account_id, ts_init)
+        parse_account_state(
+            wallet_balance,
+            account_info.result.margin_mode,
+            account_id,
+            ts_init,
+        )
     }
 
     /// Request multiple order status reports.

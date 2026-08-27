@@ -18,6 +18,7 @@
         {
           "coin": "USDT",
           "equity": "100.0",
+          "usdValue": "100.0",
           "walletBalance": "100.0",
           "availableToWithdraw": "0",
           "availableToBorrow": "",

@@ -47,7 +47,7 @@ use ustr::Ustr;
 use crate::{
     common::{
         consts::BYBIT_VENUE,
-        enums::{BybitEnvironment, BybitPositionIdx, BybitProductType},
+        enums::{BybitEnvironment, BybitMarginMode, BybitPositionIdx, BybitProductType},
         parse::{make_bybit_symbol, parse_bbo_level, parse_bbo_side_type},
     },
     python::params::{BybitWsAmendOrderParams, BybitWsCancelOrderParams, BybitWsPlaceOrderParams},
@@ -280,12 +280,14 @@ impl BybitWebSocketClient {
     /// Returns an error if the underlying WebSocket connection cannot be established,
     /// after retrying multiple times with exponential backoff.
     #[pyo3(name = "connect")]
+    #[pyo3(signature = (loop_, callback, margin_mode=None))]
     #[expect(clippy::needless_pass_by_value)] // PyO3 extracted parameter
     fn py_connect<'py>(
         &mut self,
         py: Python<'py>,
         loop_: Py<PyAny>,
         callback: Py<PyAny>,
+        margin_mode: Option<BybitMarginMode>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let call_soon: Py<PyAny> = loop_.getattr(py, "call_soon_threadsafe")?;
         let mut client = self.clone();
@@ -403,7 +405,14 @@ impl BybitWebSocketClient {
                             );
                         }
                         BybitWsMessage::AccountWallet(ref msg) => {
-                            handle_account_wallet(msg, account_id, clock, &call_soon, &callback);
+                            handle_account_wallet(
+                                msg,
+                                account_id,
+                                margin_mode,
+                                clock,
+                                &call_soon,
+                                &callback,
+                            );
                         }
                         BybitWsMessage::AccountPosition(ref msg) => {
                             handle_account_position(
@@ -1771,6 +1780,7 @@ fn handle_account_execution_fast(
 fn handle_account_wallet(
     msg: &crate::websocket::messages::BybitWsAccountWalletMsg,
     account_id: Option<AccountId>,
+    margin_mode: Option<BybitMarginMode>,
     clock: &AtomicTime,
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
@@ -1780,9 +1790,13 @@ fn handle_account_wallet(
     let Some(account_id) = account_id else {
         return;
     };
+    let Some(margin_mode) = margin_mode else {
+        log::error!("Cannot publish Bybit account state: margin mode was not provided");
+        return;
+    };
 
     for wallet in &msg.data {
-        match parse_ws_account_state(wallet, account_id, ts_event, ts_init) {
+        match parse_ws_account_state(wallet, margin_mode, account_id, ts_event, ts_init) {
             Ok(state) => send_to_python(state, call_soon, callback),
             Err(e) => log::error!("Failed to parse account state: {e}"),
         }
