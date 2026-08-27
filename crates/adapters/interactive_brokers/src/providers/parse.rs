@@ -57,14 +57,16 @@ pub fn tick_size_to_precision(tick_size: f64) -> u8 {
     }
 }
 
-/// Converts an IBKR derivative last trade timestamp to [`UnixNanos`].
+/// Converts IBKR derivative expiration facts to [`UnixNanos`].
 ///
 /// Explicit timestamps use their timezone token, or `ContractDetails.time_zone_id` when omitted.
-/// Date-only values require `ContractDetails.last_trade_time` and `time_zone_id`.
+/// Date-only values require `ContractDetails.last_trade_time` and `time_zone_id`. Standard U.S.
+/// equity options may omit `last_trade_time`; when the last-trade and real-expiration dates agree,
+/// they use the OCC expiration time of 23:59 Eastern.
 ///
 /// # Errors
 ///
-/// Returns an error if the exact last trade instant cannot be resolved without ambiguity.
+/// Returns an error if the exact expiration or last-trade instant cannot be resolved.
 pub fn expiry_timestring_to_unix_nanos(
     expiry: &str,
     details: Option<&ibapi::contracts::ContractDetails>,
@@ -81,10 +83,10 @@ pub fn expiry_timestring_to_unix_nanos(
     let explicit_time = parts.next();
     let explicit_timezone = parts.next();
     if parts.next().is_some() {
-        anyhow::bail!("Invalid IBKR derivative last trade timestamp '{expiry}'");
+        anyhow::bail!("Invalid IBKR derivative expiration timestamp '{expiry}'");
     }
 
-    let (time, timezone) = if let Some(time) = explicit_time {
+    let (date, time, timezone) = if let Some(time) = explicit_time {
         let timezone = explicit_timezone
             .or_else(|| {
                 details
@@ -94,7 +96,7 @@ pub fn expiry_timestring_to_unix_nanos(
             .with_context(|| {
                 format!("IBKR derivative timestamp '{expiry}' is missing its timezone")
             })?;
-        (time, timezone)
+        (date, time, timezone)
     } else {
         let details = details.with_context(|| {
             format!("IBKR derivative last trade date '{date}' has no ContractDetails")
@@ -107,20 +109,31 @@ pub fn expiry_timestring_to_unix_nanos(
             );
         }
 
-        let time = details.last_trade_time.trim();
-        if time.is_empty() {
-            anyhow::bail!(
-                "IBKR derivative last trade date '{date}' is missing ContractDetails.last_trade_time"
-            );
-        }
-
         let timezone = details.time_zone_id.trim();
         if timezone.is_empty() {
             anyhow::bail!(
                 "IBKR derivative last trade date '{date}' is missing ContractDetails.time_zone_id"
             );
         }
-        (time, timezone)
+
+        let time = details.last_trade_time.trim();
+        if time.is_empty() {
+            let real_expiration_date = details.real_expiration_date.trim();
+            let is_standard_us_equity_option = details.contract.security_type
+                == SecurityType::Option
+                && details.under_security_type == "STK"
+                && details.contract.currency.as_str() == "USD"
+                && matches!(timezone, "US/Eastern" | "America/New_York");
+            if is_standard_us_equity_option && real_expiration_date == date {
+                (real_expiration_date, "23:59", timezone)
+            } else {
+                anyhow::bail!(
+                    "IBKR derivative last trade date '{date}' is missing ContractDetails.last_trade_time"
+                );
+            }
+        } else {
+            (date, time, timezone)
+        }
     };
 
     let format = match time.len() {
@@ -130,7 +143,7 @@ pub fn expiry_timestring_to_unix_nanos(
     };
     let local_label = format!("{date} {time}");
     let local = DateTime::strptime(format, &local_label)
-        .with_context(|| format!("Invalid IBKR derivative last trade timestamp '{local_label}'"))?;
+        .with_context(|| format!("Invalid IBKR derivative expiration timestamp '{local_label}'"))?;
     let timezone_name = timezone;
     let timezone = get_timezone(timezone_name).with_context(|| {
         format!("Unknown IBKR derivative timezone '{timezone_name}' for '{local_label}'")
@@ -139,14 +152,14 @@ pub fn expiry_timestring_to_unix_nanos(
     let timestamp = match ambiguous.offset() {
         AmbiguousOffset::Unambiguous { .. } => ambiguous.unambiguous()?,
         AmbiguousOffset::Fold { .. } => anyhow::bail!(
-            "IBKR derivative last trade timestamp '{local_label}' is ambiguous in timezone '{timezone_name}'"
+            "IBKR derivative expiration timestamp '{local_label}' is ambiguous in timezone '{timezone_name}'"
         ),
         AmbiguousOffset::Gap { .. } => anyhow::bail!(
-            "IBKR derivative last trade timestamp '{local_label}' does not exist in timezone '{timezone_name}'"
+            "IBKR derivative expiration timestamp '{local_label}' does not exist in timezone '{timezone_name}'"
         ),
     };
     let nanos = u64::try_from(timestamp.as_nanosecond()).with_context(|| {
-        format!("IBKR derivative last trade timestamp '{local_label}' was before the Unix epoch")
+        format!("IBKR derivative expiration timestamp '{local_label}' was before the Unix epoch")
     })?;
 
     Ok(UnixNanos::from(nanos))
@@ -611,6 +624,53 @@ mod tests {
             Some(UnixNanos::from(1_773_432_000_000_000_000))
         );
         assert_eq!(option.underlying(), Some(Ustr::from("^SPX")));
+    }
+
+    #[rstest]
+    fn test_parse_date_only_us_equity_option_expiration_boundaries() {
+        let details = ContractDetails {
+            contract: Contract {
+                contract_id: 851_284_071,
+                symbol: Symbol::from("MU"),
+                security_type: SecurityType::Option,
+                exchange: Exchange::from("AMEX"),
+                currency: Currency::from("USD"),
+                local_symbol: "MU    260918C00880000".to_string(),
+                last_trade_date_or_contract_month: "20260918".to_string(),
+                right: Some(OptionRight::Call),
+                strike: 880.0,
+                multiplier: "100".to_string(),
+                ..Default::default()
+            },
+            min_tick: 0.01,
+            under_symbol: "MU".to_string(),
+            under_security_type: "STK".to_string(),
+            real_expiration_date: "20260918".to_string(),
+            last_trade_time: String::new(),
+            time_zone_id: "US/Eastern".to_string(),
+            ..Default::default()
+        };
+        let instrument_id = InstrumentId::new(
+            NautilusSymbol::from("MU    260918C00880000"),
+            Venue::from("AMEX"),
+        );
+
+        let instrument = parse_ib_contract_to_instrument(&details, instrument_id).unwrap();
+        let mut index_option = details.clone();
+        index_option.under_security_type = "IND".to_string();
+        let index_error =
+            parse_ib_contract_to_instrument(&index_option, instrument_id).unwrap_err();
+        let mut mismatched_expiration = details;
+        mismatched_expiration.real_expiration_date = "20260919".to_string();
+        let mismatch_error =
+            parse_ib_contract_to_instrument(&mismatched_expiration, instrument_id).unwrap_err();
+
+        assert_eq!(
+            instrument.expiration_ns(),
+            Some(UnixNanos::from(1_789_790_340_000_000_000))
+        );
+        assert!(format!("{index_error:#}").contains("missing ContractDetails.last_trade_time"));
+        assert!(format!("{mismatch_error:#}").contains("missing ContractDetails.last_trade_time"));
     }
 
     #[rstest]
