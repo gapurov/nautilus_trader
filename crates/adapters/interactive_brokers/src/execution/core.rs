@@ -68,6 +68,7 @@ use nautilus_common::{
 };
 use nautilus_core::{
     Params, UUID4, UnixNanos,
+    datetime::checked_mins_to_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{ExecutionClientCore, execution::failure::CommandFailure};
@@ -177,6 +178,14 @@ pub struct InteractiveBrokersExecutionClient {
 
 type CommissionCache = FifoCacheMap<String, (f64, String), 10_000>;
 type PendingExecutionCache = FifoCacheMap<String, ExecutionData, 10_000>;
+
+#[derive(Default)]
+struct MassStatusReportSet {
+    order_reports: Vec<OrderStatusReport>,
+    fill_reports: Vec<FillReport>,
+    position_reports: Vec<PositionStatusReport>,
+    reports_complete: bool,
+}
 
 #[derive(Clone, Debug)]
 struct PendingComboFill {
@@ -317,11 +326,217 @@ impl InteractiveBrokersExecutionClient {
         })
     }
 
+    fn sync_submit_instruments_from_cache<I>(&self, instrument_ids: I) -> anyhow::Result<()>
+    where
+        I: IntoIterator<Item = InstrumentId>,
+    {
+        let instruments = {
+            let cache = self.core.cache();
+            instrument_ids
+                .into_iter()
+                .map(|instrument_id| {
+                    cache.instrument(&instrument_id).cloned().with_context(|| {
+                        format!("instrument {instrument_id} not found in execution cache")
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        };
+
+        for instrument in instruments {
+            let instrument_id = instrument.id();
+            anyhow::ensure!(
+                self.instrument_provider
+                    .add_cached_instruments([instrument])
+                    == 1,
+                "Instrument {instrument_id} from execution cache could not be added to the Interactive Brokers instrument provider",
+            );
+        }
+
+        Ok(())
+    }
+
+    fn build_mass_status(
+        &self,
+        ts_init: UnixNanos,
+        lookback_start: Option<UnixNanos>,
+        reports: MassStatusReportSet,
+    ) -> ExecutionMassStatus {
+        let mut mass_status = ExecutionMassStatus::new(
+            self.core.client_id,
+            self.core.account_id,
+            self.core.venue,
+            ts_init,
+            Some(UUID4::new()),
+        );
+        mass_status.set_report_window(lookback_start, reports.reports_complete);
+        mass_status.add_order_reports(reports.order_reports);
+        mass_status.add_fill_reports(reports.fill_reports);
+        mass_status.add_position_reports(reports.position_reports);
+        mass_status
+    }
+
+    fn append_historical_fill_report(
+        &self,
+        cmd: &GenerateFillReports,
+        exec_data: &ExecutionData,
+        commission: f64,
+        commission_currency: &str,
+        ts_init: UnixNanos,
+        reports: &mut Vec<FillReport>,
+    ) -> bool {
+        match self.parse_historical_fill_report(
+            cmd,
+            exec_data,
+            commission,
+            commission_currency,
+            ts_init,
+        ) {
+            Ok(Some(report)) => reports.push(report),
+            Ok(None) => {}
+            Err(e) => {
+                Self::warn_historical_fill_report_parse_error(exec_data, &e);
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn historical_execution_in_report_window(
+        cmd: &GenerateFillReports,
+        exec_data: &ExecutionData,
+    ) -> anyhow::Result<bool> {
+        if cmd.start.is_none() && cmd.end.is_none() {
+            return Ok(true);
+        }
+
+        let ts_event = parse_execution_time(&exec_data.execution.time)?;
+        Ok(!cmd.start.is_some_and(|start| ts_event < start)
+            && !cmd.end.is_some_and(|end| ts_event > end))
+    }
+
+    async fn collect_fill_reports(
+        &self,
+        cmd: &GenerateFillReports,
+    ) -> anyhow::Result<(Vec<FillReport>, bool)> {
+        let client = self.ib_client.as_ref().context("IB client not connected")?;
+
+        let account_code = self.core.account_id.to_string();
+        let time_filter = if let Some(start) = cmd.start {
+            let start_dt = start.to_datetime_utc();
+            start_dt.strftime("%Y%m%d-%H:%M:%S").to_string()
+        } else {
+            String::new()
+        };
+
+        let filter = ExecutionFilter {
+            client_id: None,
+            account_code,
+            time: time_filter,
+            symbol: String::new(),
+            security_type: String::new(),
+            exchange: String::new(),
+            side: None,
+            last_n_days: 0,
+            specific_dates: Vec::new(),
+        };
+
+        let timeout_dur = Duration::from_secs(self.config.request_timeout);
+        let subscription = tokio::time::timeout(timeout_dur, client.executions(filter))
+            .await
+            .context("Timeout requesting executions")??;
+        let mut subscription = subscription.filter_data();
+        let mut reports = Vec::new();
+        let mut reports_complete = true;
+        let ts_init = get_atomic_clock_realtime().get_time_ns();
+        let mut pending_exec_data: AHashMap<String, ExecutionData> = AHashMap::new();
+        let mut pending_commissions: AHashMap<String, (f64, String)> = AHashMap::new();
+
+        while let Some(exec_result) = subscription.next().await {
+            match exec_result {
+                Ok(Executions::ExecutionData(exec_data)) => {
+                    let execution_id = exec_data.execution.execution_id.clone();
+                    if let Some((commission, commission_currency)) =
+                        pending_commissions.remove(&execution_id)
+                    {
+                        reports_complete &= self.append_historical_fill_report(
+                            cmd,
+                            &exec_data,
+                            commission,
+                            &commission_currency,
+                            ts_init,
+                            &mut reports,
+                        );
+                    } else {
+                        pending_exec_data.insert(execution_id, exec_data);
+                    }
+                }
+                Ok(Executions::CommissionReport(commission)) => {
+                    if let Some(exec_data) = pending_exec_data.remove(&commission.execution_id) {
+                        reports_complete &= self.append_historical_fill_report(
+                            cmd,
+                            &exec_data,
+                            commission.commission,
+                            &commission.currency,
+                            ts_init,
+                            &mut reports,
+                        );
+                    } else {
+                        pending_commissions.insert(
+                            commission.execution_id,
+                            (commission.commission, commission.currency),
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Error receiving execution data: {e}");
+                    reports_complete = false;
+                }
+            }
+        }
+
+        pending_exec_data.retain(
+            |_, exec_data| match Self::historical_execution_in_report_window(cmd, exec_data) {
+                Ok(in_window) => in_window,
+                Err(e) => {
+                    Self::warn_historical_fill_report_parse_error(exec_data, &e);
+                    reports_complete = false;
+                    false
+                }
+            },
+        );
+
+        if !pending_exec_data.is_empty() {
+            tracing::warn!(
+                "Skipped {} historical fill reports because IB did not provide matching commission reports",
+                pending_exec_data.len()
+            );
+            reports_complete = false;
+        }
+
+        if !pending_commissions.is_empty() {
+            tracing::warn!(
+                "Skipped {} historical commission reports because IB did not provide matching executions",
+                pending_commissions.len()
+            );
+            reports_complete = false;
+        }
+
+        Ok((reports, reports_complete))
+    }
+
     fn submit_order_list_with_orders(
         &self,
         cmd: SubmitOrderList,
         orders: Vec<OrderAny>,
     ) -> anyhow::Result<()> {
+        if let Err(e) = self
+            .sync_submit_instruments_from_cache(orders.iter().map(|order| order.instrument_id()))
+        {
+            self.deny_submit_order_list(&cmd, &e.to_string())?;
+            return Ok(());
+        }
+
         let client = self.ib_client.as_ref().context("IB client not connected")?;
 
         let order_id_map = Arc::clone(&self.order_id_map);
@@ -533,7 +748,12 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         if let Err(reason) = self.ensure_client_ready_for_order_request("submit order") {
-            self.deny_submit_order_not_ready(&cmd, &reason)?;
+            self.deny_submit_order(&cmd, &reason)?;
+            return Ok(());
+        }
+
+        if let Err(e) = self.sync_submit_instruments_from_cache([cmd.instrument_id]) {
+            self.deny_submit_order(&cmd, &e.to_string())?;
             return Ok(());
         }
 
@@ -854,21 +1074,14 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     }
 
                     // Convert IB contract to instrument ID
-                    let instrument_id =
-                        match self.resolve_report_contract_instrument_id(&data.contract) {
-                            Ok(instrument_id) => instrument_id,
-                            Err(e) => {
-                                tracing::warn!(
-                                    order_id = data.order_id,
-                                    sec_type = ?data.contract.security_type,
-                                    symbol = data.contract.symbol.as_str(),
-                                    con_id = data.contract.contract_id,
-                                    error = %e,
-                                    "Failed to resolve IBKR order status report instrument ID",
-                                );
-                                continue;
-                            }
-                        };
+                    let instrument_id = self
+                        .resolve_report_contract_instrument_id(&data.contract)
+                        .with_context(|| {
+                            format!(
+                                "failed to resolve IBKR order status report instrument ID for order {}",
+                                data.order_id,
+                            )
+                        })?;
 
                     // Filter by instrument_id if specified
                     if let Some(filter_id) = cmd.instrument_id {
@@ -915,7 +1128,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                             reports.push(report);
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to parse order status report: {e}");
+                            return Err(e).context("failed to parse order status report");
                         }
                     }
                 }
@@ -923,7 +1136,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     // Ignore other order types
                 }
                 Err(e) => {
-                    tracing::warn!("Error receiving order data: {e}");
+                    anyhow::bail!("Error receiving order data: {e}");
                 }
             }
         }
@@ -933,6 +1146,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                 .await
                 .context("Timeout requesting positions for synthetic order reports")??;
             let mut positions = positions.filter_data();
+            let mut received_position_end = false;
 
             while let Some(position_result) = positions.next().await {
                 match position_result {
@@ -948,21 +1162,18 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         {
                             Ok(Some(instrument)) => instrument,
                             Ok(None) => {
-                                tracing::warn!(
-                                    con_id = position.contract.contract_id,
-                                    sec_type = ?position.contract.security_type,
-                                    "Cannot generate synthetic order report: instrument not found",
+                                anyhow::bail!(
+                                    "Cannot generate synthetic order report: instrument not found for contract {}",
+                                    position.contract.contract_id,
                                 );
-                                continue;
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    con_id = position.contract.contract_id,
-                                    sec_type = ?position.contract.security_type,
-                                    error = %e,
-                                    "Failed to resolve instrument for synthetic order report",
-                                );
-                                continue;
+                                return Err(e).with_context(|| {
+                                    format!(
+                                        "failed to resolve instrument for synthetic order report contract {}",
+                                        position.contract.contract_id,
+                                    )
+                                });
                             }
                         };
 
@@ -1017,12 +1228,22 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         );
                         reports.push(report);
                     }
-                    Ok(PositionUpdate::PositionEnd) => break,
-                    Err(e) => tracing::warn!(
-                        "Error receiving position data for synthetic order report: {e}"
-                    ),
+                    Ok(PositionUpdate::PositionEnd) => {
+                        received_position_end = true;
+                        break;
+                    }
+                    Err(e) => {
+                        anyhow::bail!(
+                            "Error receiving position data for synthetic order report: {e}"
+                        );
+                    }
                 }
             }
+
+            anyhow::ensure!(
+                received_position_end,
+                "IB synthetic position stream ended before PositionEnd",
+            );
         }
 
         Ok(reports)
@@ -1032,92 +1253,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let client = self.ib_client.as_ref().context("IB client not connected")?;
-
-        // Get account code from account ID
-        let account_code = self.core.account_id.to_string();
-
-        // Build time filter from start if provided.
-        let time_filter = if let Some(start) = cmd.start {
-            let start_dt = start.to_datetime_utc();
-            start_dt.strftime("%Y%m%d-%H:%M:%S").to_string()
-        } else {
-            String::new()
-        };
-
-        let filter = ExecutionFilter {
-            client_id: None,
-            account_code,
-            time: time_filter,
-            symbol: String::new(),
-            security_type: String::new(),
-            exchange: String::new(),
-            side: None,
-            last_n_days: 0,
-            specific_dates: Vec::new(),
-        };
-
-        let timeout_dur = Duration::from_secs(self.config.request_timeout);
-        let subscription = tokio::time::timeout(timeout_dur, client.executions(filter))
-            .await
-            .context("Timeout requesting executions")??;
-        let mut subscription = subscription.filter_data();
-        let mut reports = Vec::new();
-        let ts_init = get_atomic_clock_realtime().get_time_ns();
-        let mut pending_exec_data: AHashMap<String, ExecutionData> = AHashMap::new();
-        let mut pending_commissions: AHashMap<String, (f64, String)> = AHashMap::new();
-
-        while let Some(exec_result) = subscription.next().await {
-            match exec_result {
-                Ok(Executions::ExecutionData(exec_data)) => {
-                    let execution_id = exec_data.execution.execution_id.clone();
-                    if let Some((commission, commission_currency)) =
-                        pending_commissions.remove(&execution_id)
-                    {
-                        if let Some(report) = self.parse_historical_fill_report(
-                            &cmd,
-                            &exec_data,
-                            commission,
-                            &commission_currency,
-                            ts_init,
-                        ) {
-                            reports.push(report);
-                        }
-                    } else {
-                        pending_exec_data.insert(execution_id, exec_data);
-                    }
-                }
-                Ok(Executions::CommissionReport(commission)) => {
-                    if let Some(exec_data) = pending_exec_data.remove(&commission.execution_id) {
-                        if let Some(report) = self.parse_historical_fill_report(
-                            &cmd,
-                            &exec_data,
-                            commission.commission,
-                            &commission.currency,
-                            ts_init,
-                        ) {
-                            reports.push(report);
-                        }
-                    } else {
-                        pending_commissions.insert(
-                            commission.execution_id,
-                            (commission.commission, commission.currency),
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Error receiving execution data: {e}");
-                }
-            }
-        }
-
-        if !pending_exec_data.is_empty() {
-            tracing::warn!(
-                "Skipped {} historical fill reports because IB did not provide matching commission reports",
-                pending_exec_data.len()
-            );
-        }
-
+        let (reports, _) = self.collect_fill_reports(&cmd).await?;
         Ok(reports)
     }
 
@@ -1135,6 +1271,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         let mut reports = Vec::new();
         let ts_init = get_atomic_clock_realtime().get_time_ns();
         let raw_account_id = raw_ib_account_code(&self.core.account_id);
+        let mut received_position_end = false;
 
         // Process positions until PositionEnd; return empty list when none (reconciliation parity:
         // never return None/missing for "no positions").
@@ -1153,21 +1290,18 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     {
                         Ok(Some(instrument)) => instrument,
                         Ok(None) => {
-                            tracing::warn!(
-                                con_id = position.contract.contract_id,
-                                sec_type = ?position.contract.security_type,
-                                "Cannot generate position status report: instrument not found",
+                            anyhow::bail!(
+                                "Cannot generate position status report: instrument not found for contract {}",
+                                position.contract.contract_id,
                             );
-                            continue;
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                con_id = position.contract.contract_id,
-                                sec_type = ?position.contract.security_type,
-                                error = %e,
-                                "Failed to resolve position instrument",
-                            );
-                            continue;
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "failed to resolve position instrument for contract {}",
+                                    position.contract.contract_id,
+                                )
+                            });
                         }
                     };
                     let instrument_id = instrument.id();
@@ -1214,14 +1348,19 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     reports.push(report);
                 }
                 Ok(PositionUpdate::PositionEnd) => {
-                    // End of position list
+                    received_position_end = true;
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!("Error receiving position data: {e}");
+                    anyhow::bail!("Error receiving position data: {e}");
                 }
             }
         }
+
+        anyhow::ensure!(
+            received_position_end,
+            "IB position stream ended before PositionEnd",
+        );
 
         if reports.is_empty()
             && let Some(instrument_id) = cmd.instrument_id
@@ -1251,10 +1390,13 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
         let ts_now = get_atomic_clock_realtime().get_time_ns();
-        let start = lookback_mins.map(|mins| {
-            let lookback_ns = mins * 60 * 1_000_000_000;
-            UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
-        });
+        let start = if let Some(mins) = lookback_mins {
+            let lookback_ns = checked_mins_to_nanos(mins)
+                .context("lookback minutes exceed the nanosecond range")?;
+            Some(UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns)))
+        } else {
+            None
+        };
 
         let order_cmd = GenerateOrderStatusReportsBuilder::default()
             .ts_init(ts_now)
@@ -1275,9 +1417,9 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             .build()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let (order_reports, fill_reports, position_reports) = tokio::try_join!(
+        let (order_reports, (fill_reports, fill_reports_complete), position_reports) = tokio::try_join!(
             self.generate_order_status_reports(&order_cmd),
-            self.generate_fill_reports(fill_cmd),
+            self.collect_fill_reports(&fill_cmd),
             self.generate_position_status_reports(&position_cmd),
         )?;
 
@@ -1288,17 +1430,16 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             position_reports.len()
         );
 
-        let mut mass_status = ExecutionMassStatus::new(
-            self.core.client_id,
-            self.core.account_id,
-            self.core.venue,
+        let mass_status = self.build_mass_status(
             ts_now,
-            Some(UUID4::new()),
+            start,
+            MassStatusReportSet {
+                order_reports,
+                fill_reports,
+                position_reports,
+                reports_complete: fill_reports_complete,
+            },
         );
-
-        mass_status.add_order_reports(order_reports);
-        mass_status.add_fill_reports(fill_reports);
-        mass_status.add_position_reports(position_reports);
 
         Ok(Some(mass_status))
     }
@@ -1522,7 +1663,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
         if let Err(reason) = self.ensure_client_ready_for_order_request("submit order list") {
-            self.deny_submit_order_list_not_ready(&cmd, &reason)?;
+            self.deny_submit_order_list(&cmd, &reason)?;
             return Ok(());
         }
 
@@ -1822,7 +1963,7 @@ impl InteractiveBrokersExecutionClient {
         Err(reason)
     }
 
-    fn deny_submit_order_not_ready(&self, cmd: &SubmitOrder, reason: &str) -> anyhow::Result<()> {
+    fn deny_submit_order(&self, cmd: &SubmitOrder, reason: &str) -> anyhow::Result<()> {
         Self::send_order_denied(
             cmd.order_init.trader_id,
             cmd.strategy_id,
@@ -1832,16 +1973,12 @@ impl InteractiveBrokersExecutionClient {
         )
     }
 
-    fn deny_submit_order_list_not_ready(
-        &self,
-        cmd: &SubmitOrderList,
-        reason: &str,
-    ) -> anyhow::Result<()> {
+    fn deny_submit_order_list(&self, cmd: &SubmitOrderList, reason: &str) -> anyhow::Result<()> {
         for order_init in &cmd.order_inits {
             Self::send_order_denied(
                 order_init.trader_id,
                 cmd.strategy_id,
-                cmd.instrument_id,
+                order_init.instrument_id,
                 order_init.client_order_id,
                 reason,
             )?;
@@ -1934,40 +2071,27 @@ impl InteractiveBrokersExecutionClient {
         commission: f64,
         commission_currency: &str,
         ts_init: UnixNanos,
-    ) -> Option<FillReport> {
-        let instrument_id = match self.resolve_historical_execution_instrument_id(exec_data) {
-            Ok(instrument_id) => instrument_id,
-            Err(e) => {
-                Self::warn_historical_fill_report_parse_error(exec_data, &e);
-                return None;
-            }
-        };
+    ) -> anyhow::Result<Option<FillReport>> {
+        if !Self::historical_execution_in_report_window(cmd, exec_data)? {
+            return Ok(None);
+        }
+
+        let instrument_id = self.resolve_historical_execution_instrument_id(exec_data)?;
 
         if let Some(filter_id) = cmd.instrument_id
             && instrument_id != filter_id
         {
-            return None;
+            return Ok(None);
         }
 
         if let Some(filter_venue_order_id) = cmd.venue_order_id
             && ib_venue_order_id(exec_data.execution.order_id, exec_data.execution.perm_id)
                 != filter_venue_order_id
         {
-            return None;
+            return Ok(None);
         }
 
-        if let Some(end) = cmd.end {
-            match parse_execution_time(&exec_data.execution.time) {
-                Ok(ts_event) if ts_event > end => return None,
-                Ok(_) => {}
-                Err(e) => {
-                    Self::warn_historical_fill_report_parse_error(exec_data, &e);
-                    return None;
-                }
-            }
-        }
-
-        match parse_execution_to_fill_report(
+        parse_execution_to_fill_report(
             &exec_data.execution,
             &exec_data.contract,
             commission,
@@ -1977,13 +2101,8 @@ impl InteractiveBrokersExecutionClient {
             &self.instrument_provider,
             ts_init,
             None, // avg_px (not available in historical fills)
-        ) {
-            Ok(report) => Some(report),
-            Err(e) => {
-                Self::warn_historical_fill_report_parse_error(exec_data, &e);
-                None
-            }
-        }
+        )
+        .map(Some)
     }
 
     fn resolve_historical_execution_instrument_id(

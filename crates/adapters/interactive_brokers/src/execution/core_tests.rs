@@ -11,8 +11,8 @@ use std::{cell::RefCell, rc::Rc, str::FromStr};
 
 use ibapi::{
     contracts::{
-        Contract, Currency as IBCurrency, Exchange, LegAction, OptionRight, SecurityType,
-        Symbol as IBSymbol,
+        Contract, ContractDetails, Currency as IBCurrency, Exchange, LegAction, OptionRight,
+        SecurityType, Symbol as IBSymbol,
     },
     orders::{
         CommissionReport, Execution, ExecutionData, ExecutionSide, Liquidity, Order as IBOrder,
@@ -39,7 +39,10 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use super::*;
-use crate::common::consts::{IB_CLIENT_ID, IB_VENUE};
+use crate::{
+    common::consts::{IB_CLIENT_ID, IB_VENUE},
+    providers::parse::parse_ib_contract_to_instrument,
+};
 
 fn create_test_instrument_provider() -> Arc<InteractiveBrokersInstrumentProvider> {
     let config = crate::config::InteractiveBrokersInstrumentProviderConfig::default();
@@ -831,6 +834,159 @@ fn submit_order_list_denies_all_orders_when_client_not_ready() {
 }
 
 #[rstest]
+fn sync_submit_instruments_from_cache_adds_late_instrument() {
+    let (client, _, cache) = create_test_execution_client();
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let details = ContractDetails {
+        contract: Contract {
+            contract_id: 265_598,
+            symbol: IBSymbol::from("AAPL"),
+            security_type: SecurityType::Stock,
+            exchange: Exchange::from("SMART"),
+            primary_exchange: Exchange::from("NASDAQ"),
+            currency: IBCurrency::from("USD"),
+            local_symbol: String::from("AAPL"),
+            ..Default::default()
+        },
+        min_tick: 0.01,
+        price_magnifier: 100,
+        ..Default::default()
+    };
+    let instrument = parse_ib_contract_to_instrument(&details, instrument_id).unwrap();
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    client
+        .instrument_provider
+        .insert_test_instrument(InstrumentAny::from(equity_aapl()), 111, 1);
+
+    client
+        .sync_submit_instruments_from_cache([instrument_id])
+        .unwrap();
+
+    let provider_instrument = client.instrument_provider.find(&instrument_id).unwrap();
+    assert_eq!(
+        serde_json::to_value(provider_instrument).unwrap(),
+        serde_json::to_value(instrument).unwrap(),
+    );
+    assert!(
+        client
+            .instrument_provider
+            .get_instrument_id_by_contract_id(111)
+            .is_none()
+    );
+    assert_eq!(
+        client
+            .instrument_provider
+            .get_instrument_id_by_contract_id(265_598),
+        Some(instrument_id),
+    );
+    assert_eq!(
+        client
+            .instrument_provider
+            .resolve_contract_for_instrument(instrument_id)
+            .unwrap()
+            .contract_id,
+        265_598,
+    );
+}
+
+#[rstest]
+fn sync_submit_instruments_from_cache_rejects_missing_instrument() {
+    let (client, _, _) = create_test_execution_client();
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+
+    let error = client
+        .sync_submit_instruments_from_cache([instrument_id])
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "instrument AAPL.XNAS not found in execution cache",
+    );
+    assert!(client.instrument_provider.find(&instrument_id).is_none());
+}
+
+#[rstest]
+fn sync_submit_instruments_from_cache_rejects_invalid_contract_metadata() {
+    let (client, _, cache) = create_test_execution_client();
+    let instrument = InstrumentAny::from(equity_aapl());
+    let instrument_id = instrument.id();
+    cache.borrow_mut().add_instrument(instrument).unwrap();
+    client
+        .instrument_provider
+        .insert_test_instrument(InstrumentAny::from(equity_aapl()), 111, 1);
+
+    let error = client
+        .sync_submit_instruments_from_cache([instrument_id])
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "Instrument AAPL.XNAS from execution cache could not be added to the Interactive Brokers instrument provider",
+    );
+}
+
+#[rstest]
+fn submit_order_list_denies_when_instrument_sync_fails() {
+    let (client, mut rx, _) = create_test_execution_client();
+    let order = create_test_limit_order(ClientOrderId::from("O-IB-001"));
+    let client_order_id = order.client_order_id();
+    let order_list = OrderList::new(
+        OrderListId::from("OL-IB-001"),
+        order.instrument_id(),
+        order.strategy_id(),
+        vec![client_order_id],
+        UnixNanos::default(),
+    );
+    let cmd = SubmitOrderList::new(
+        client.core.trader_id,
+        Some(client.core.client_id),
+        order.strategy_id(),
+        order_list,
+        vec![OrderInitialized::from(&order)],
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+
+    client
+        .submit_order_list_with_orders(cmd, vec![order])
+        .unwrap();
+
+    let OrderEventAny::Denied(event) = next_order_event(&mut rx) else {
+        panic!("Expected OrderDenied")
+    };
+    assert_eq!(event.client_order_id, client_order_id);
+    assert_eq!(
+        event.reason.to_string(),
+        "instrument AAPL.SMART not found in execution cache",
+    );
+}
+
+#[rstest]
+fn build_mass_status_sets_bounded_incomplete_report_contract() {
+    let (client, _, _) = create_test_execution_client();
+    let lookback_start = UnixNanos::from(500_000_000);
+
+    let mass_status = client.build_mass_status(
+        UnixNanos::from(1_000_000_000),
+        Some(lookback_start),
+        MassStatusReportSet {
+            reports_complete: false,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(mass_status.lookback_start(), Some(lookback_start));
+    assert!(!mass_status.reports_complete());
+}
+
+#[rstest]
 fn modify_order_rejects_when_client_not_ready() {
     let (client, mut rx, _) = create_test_execution_client();
     let order = create_test_limit_order(ClientOrderId::from("O-IB-001"));
@@ -1562,6 +1718,7 @@ fn test_parse_historical_fill_report_uses_provider_resolved_stock_venue() {
 
     let report = client
         .parse_historical_fill_report(&cmd, &exec_data, 1.25, "USD", UnixNanos::default())
+        .unwrap()
         .unwrap();
 
     assert_eq!(report.instrument_id, instrument_id);
@@ -1573,6 +1730,91 @@ fn test_parse_historical_fill_report_uses_provider_resolved_stock_venue() {
     assert_eq!(report.venue_order_id, VenueOrderId::from("123"));
     assert_eq!(report.last_qty, Quantity::from(10));
     assert_eq!(report.last_px, Price::from("150.25"));
+}
+
+#[rstest]
+fn test_append_historical_fill_report_marks_missing_instrument_incomplete() {
+    let (client, _, _) = create_test_execution_client();
+    let exec_data = create_test_stock_execution_data(0, 123, "exec-aapl-001");
+    let cmd = GenerateFillReportsBuilder::default()
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap();
+    let mut reports = Vec::new();
+
+    let complete = client.append_historical_fill_report(
+        &cmd,
+        &exec_data,
+        1.25,
+        "USD",
+        UnixNanos::default(),
+        &mut reports,
+    );
+
+    assert!(!complete);
+    assert!(reports.is_empty());
+}
+
+#[rstest]
+#[case(-1, 1)]
+#[case(0, 1)]
+#[case(1, 0)]
+fn test_append_historical_fill_report_applies_nanosecond_start_bound(
+    #[case] start_offset_ns: i64,
+    #[case] expected_reports: usize,
+) {
+    let (client, _, _) = create_test_execution_client();
+    let equity = equity_aapl();
+    client
+        .instrument_provider
+        .insert_test_instrument(InstrumentAny::from(equity), 265_598, 1);
+    let exec_data = create_test_stock_execution_data(265_598, 123, "exec-aapl-001");
+    let ts_event = parse_execution_time(&exec_data.execution.time).unwrap();
+    let cmd = GenerateFillReportsBuilder::default()
+        .ts_init(UnixNanos::default())
+        .start(Some(UnixNanos::from(
+            ts_event.as_u64().saturating_add_signed(start_offset_ns),
+        )))
+        .build()
+        .unwrap();
+    let mut reports = Vec::new();
+
+    let complete = client.append_historical_fill_report(
+        &cmd,
+        &exec_data,
+        1.25,
+        "USD",
+        UnixNanos::default(),
+        &mut reports,
+    );
+
+    assert!(complete);
+    assert_eq!(reports.len(), expected_reports);
+}
+
+#[rstest]
+fn test_append_historical_fill_report_filters_time_before_instrument_resolution() {
+    let (client, _, _) = create_test_execution_client();
+    let exec_data = create_test_stock_execution_data(265_598, 123, "exec-aapl-001");
+    let ts_event = parse_execution_time(&exec_data.execution.time).unwrap();
+    let cmd = GenerateFillReportsBuilder::default()
+        .ts_init(UnixNanos::default())
+        .start(Some(UnixNanos::from(ts_event.as_u64() + 1)))
+        .build()
+        .unwrap();
+    let mut reports = Vec::new();
+
+    let complete = client.append_historical_fill_report(
+        &cmd,
+        &exec_data,
+        1.25,
+        "USD",
+        UnixNanos::default(),
+        &mut reports,
+    );
+
+    assert!(complete);
+    assert!(reports.is_empty());
 }
 
 #[rstest]
@@ -1614,6 +1856,7 @@ fn test_parse_historical_fill_report_uses_cached_bag_spread_id() {
 
     let report = client
         .parse_historical_fill_report(&cmd, &exec_data, 2.00, "USD", UnixNanos::default())
+        .unwrap()
         .unwrap();
 
     assert_eq!(report.instrument_id, instrument_id);

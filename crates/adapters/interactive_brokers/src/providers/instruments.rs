@@ -309,13 +309,27 @@ impl InteractiveBrokersInstrumentProvider {
     where
         I: IntoIterator<Item = InstrumentAny>,
     {
-        let mut added = 0;
+        let mut cached = 0;
 
         for instrument in instruments {
             let instrument_id = instrument.id();
-            let Some(contract) = contract_from_instrument_info(&instrument) else {
+            let Some(mut contract) = contract_from_instrument_info(&instrument) else {
                 continue;
             };
+            let is_spread = is_spread_instrument_id(&instrument_id);
+            if is_spread != (contract.security_type == SecurityType::Spread) {
+                continue;
+            }
+
+            if is_spread && !is_valid_spread_contract(&contract) {
+                let Some(cached_contract) = self
+                    .instrument_id_to_ib_contract(&instrument_id)
+                    .filter(is_valid_spread_contract)
+                else {
+                    continue;
+                };
+                contract = cached_contract;
+            }
             let price_magnifier = price_magnifier_from_instrument_info(&instrument);
 
             if self.cache_instrument(
@@ -324,12 +338,12 @@ impl InteractiveBrokersInstrumentProvider {
                 None,
                 Some(contract),
                 price_magnifier,
-                false,
+                true,
             ) {
-                added += 1;
+                cached += 1;
             }
         }
-        added
+        cached
     }
 
     /// Determine venue from contract using provider configuration.
@@ -1484,7 +1498,36 @@ fn json_string(spec: Option<&serde_json::Value>, key: &str) -> Option<String> {
 fn contract_from_instrument_info(instrument: &InstrumentAny) -> Option<Contract> {
     let value = serde_json::to_value(instrument).ok()?;
     let contract_json = find_contract_json(&value)?;
-    parse_contract_from_json(contract_json).ok()
+    let contract_fields = contract_json.as_object()?;
+
+    for field in ["secType", "exchange", "currency"] {
+        if contract_fields
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return None;
+        }
+    }
+
+    let contract = parse_contract_from_json(contract_json).ok()?;
+    if contract.contract_id == 0 && contract.symbol.as_str().is_empty() {
+        return None;
+    }
+
+    Some(contract)
+}
+
+fn is_valid_spread_contract(contract: &Contract) -> bool {
+    contract.security_type == SecurityType::Spread
+        && !contract.exchange.is_empty()
+        && !contract.currency.as_str().is_empty()
+        && (contract.contract_id != 0 || !contract.symbol.as_str().is_empty())
+        && !contract.combo_legs.is_empty()
+        && contract
+            .combo_legs
+            .iter()
+            .all(|leg| leg.contract_id > 0 && leg.ratio > 0 && !leg.exchange.is_empty())
 }
 
 fn price_magnifier_from_instrument_info(instrument: &InstrumentAny) -> Option<i32> {
@@ -1734,6 +1777,31 @@ impl InteractiveBrokersInstrumentProvider {
     ) -> bool {
         let should_update =
             force_instrument_update || !self.instruments.contains_key(&instrument_id);
+        let previous_contract_id = self
+            .contracts
+            .get(&instrument_id)
+            .map(|contract| contract.contract_id)
+            .filter(|contract_id| *contract_id != 0);
+        let replacement_contract_id = details
+            .as_ref()
+            .map(|details| details.contract.contract_id)
+            .or_else(|| contract.as_ref().map(|contract| contract.contract_id))
+            .filter(|contract_id| *contract_id != 0);
+
+        if force_instrument_update {
+            if previous_contract_id != replacement_contract_id
+                && let Some(previous_contract_id) = previous_contract_id
+            {
+                self.contract_id_to_instrument_id
+                    .remove_if(&previous_contract_id, |_, mapped_instrument_id| {
+                        *mapped_instrument_id == instrument_id
+                    });
+            }
+
+            if details.is_none() && contract.is_some() {
+                self.contract_details.remove(&instrument_id);
+            }
+        }
 
         if should_update {
             self.instruments.insert(instrument_id, instrument);
@@ -3212,11 +3280,31 @@ mod tests {
     }
 
     #[rstest]
-    fn test_add_cached_instruments_only_seeds_ib_contracts() {
+    fn test_add_cached_instruments_refreshes_ib_contracts() {
         let provider = InteractiveBrokersInstrumentProvider::new(Default::default());
         let ib_instrument_id = InstrumentId::new(Symbol::from("AAPL"), Venue::from("XNAS"));
         let non_ib_instrument_id =
             InstrumentId::new(Symbol::from("BTCUSDT"), Venue::from("BINANCE"));
+        let old_contract = Contract {
+            contract_id: 111,
+            symbol: ibapi::contracts::Symbol::from("AAPL"),
+            security_type: SecurityType::Stock,
+            exchange: Exchange::from("SMART"),
+            primary_exchange: Exchange::from("NASDAQ"),
+            currency: ibapi::contracts::Currency::from("USD"),
+            ..Default::default()
+        };
+        provider.cache_instrument(
+            ib_instrument_id,
+            create_test_instrument(ib_instrument_id),
+            Some(ibapi::contracts::ContractDetails {
+                contract: old_contract,
+                ..Default::default()
+            }),
+            None,
+            None,
+            true,
+        );
         let contract = Contract {
             contract_id: 265598,
             symbol: ibapi::contracts::Symbol::from("AAPL"),
@@ -3238,6 +3326,12 @@ mod tests {
         assert_eq!(provider.count(), 1);
         assert!(provider.find(&ib_instrument_id).is_some());
         assert!(provider.find(&non_ib_instrument_id).is_none());
+        assert!(provider.find_by_contract_id(111).is_none());
+        assert!(
+            provider
+                .instrument_id_to_ib_contract_details(&ib_instrument_id)
+                .is_none()
+        );
         assert_eq!(
             provider
                 .resolve_contract_for_instrument(ib_instrument_id)
@@ -3246,6 +3340,126 @@ mod tests {
             265598
         );
         assert_eq!(provider.get_price_magnifier(&ib_instrument_id), 100);
+    }
+
+    #[rstest]
+    fn test_add_cached_instruments_rejects_incomplete_contract_metadata() {
+        let provider = InteractiveBrokersInstrumentProvider::new(Default::default());
+        let instrument_id = InstrumentId::new(Symbol::from("AAPL"), Venue::from("XNAS"));
+        let mut info = Params::new();
+        info.insert(
+            String::from("contract"),
+            serde_json::json!({ "symbol": "AAPL" }),
+        );
+        let instrument = create_test_instrument_with_info(instrument_id, Some(info));
+
+        let count = provider.add_cached_instruments([instrument]);
+
+        assert_eq!(count, 0);
+        assert!(provider.find(&instrument_id).is_none());
+    }
+
+    #[rstest]
+    fn test_add_cached_instruments_rejects_spread_without_valid_combo_legs() {
+        let provider = InteractiveBrokersInstrumentProvider::new(Default::default());
+        let instrument_id = InstrumentId::new(
+            Symbol::from("(1)SPY C400_((1))SPY C410"),
+            Venue::from("SMART"),
+        );
+        let contract = Contract {
+            symbol: ibapi::contracts::Symbol::from("SPY"),
+            security_type: SecurityType::Spread,
+            exchange: Exchange::from("SMART"),
+            currency: ibapi::contracts::Currency::from("USD"),
+            ..Default::default()
+        };
+        provider.cache_instrument(
+            instrument_id,
+            create_test_instrument(instrument_id),
+            None,
+            Some(contract.clone()),
+            None,
+            true,
+        );
+        let instrument = create_test_instrument_with_info(
+            instrument_id,
+            Some(create_contract_info(&contract, None)),
+        );
+
+        let count = provider.add_cached_instruments([instrument]);
+
+        assert_eq!(count, 0);
+    }
+
+    #[rstest]
+    fn test_add_cached_instruments_rejects_spread_security_type_mismatch() {
+        let provider = InteractiveBrokersInstrumentProvider::new(Default::default());
+        let instrument_id = InstrumentId::new(
+            Symbol::from("(1)SPY C400_((1))SPY C410"),
+            Venue::from("SMART"),
+        );
+        let contract = Contract {
+            symbol: ibapi::contracts::Symbol::from("SPY"),
+            security_type: SecurityType::Stock,
+            exchange: Exchange::from("SMART"),
+            currency: ibapi::contracts::Currency::from("USD"),
+            ..Default::default()
+        };
+        let instrument = create_test_instrument_with_info(
+            instrument_id,
+            Some(create_contract_info(&contract, None)),
+        );
+
+        let count = provider.add_cached_instruments([instrument]);
+
+        assert_eq!(count, 0);
+        assert!(provider.find(&instrument_id).is_none());
+    }
+
+    #[rstest]
+    fn test_add_cached_instruments_preserves_cached_spread_combo_legs() {
+        let provider = InteractiveBrokersInstrumentProvider::new(Default::default());
+        let instrument_id = InstrumentId::new(
+            Symbol::from("(1)SPY C400_((1))SPY C410"),
+            Venue::from("SMART"),
+        );
+        let contract = Contract {
+            symbol: ibapi::contracts::Symbol::from("SPY"),
+            security_type: SecurityType::Spread,
+            exchange: Exchange::from("SMART"),
+            currency: ibapi::contracts::Currency::from("USD"),
+            combo_legs: vec![ibapi::contracts::ComboLeg {
+                contract_id: 12_345,
+                ratio: 1,
+                action: ibapi::contracts::LegAction::Buy,
+                exchange: String::from("SMART"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        provider.cache_instrument(
+            instrument_id,
+            create_test_instrument(instrument_id),
+            None,
+            Some(contract.clone()),
+            None,
+            true,
+        );
+        let instrument = create_test_instrument_with_info(
+            instrument_id,
+            Some(create_contract_info(&contract, None)),
+        );
+
+        let count = provider.add_cached_instruments([instrument]);
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            provider
+                .resolve_contract_for_instrument(instrument_id)
+                .unwrap()
+                .combo_legs,
+            contract.combo_legs,
+        );
     }
 
     #[tokio::test]
