@@ -1729,9 +1729,16 @@ impl InteractiveBrokersInstrumentProvider {
             Ok(instrument) => instrument,
             Err(e) => {
                 tracing::warn!(
-                    "Failed to parse IB contract details for {}: {}",
+                    "Failed to parse IB contract details for {}: {e:#}; con_id={} trading_class={:?} last_trade_date={:?} real_expiration_date={:?} last_trade_time={:?} time_zone_id={:?} valid_exchanges={:?} liquid_hours={:?}",
                     instrument_id,
-                    e
+                    details.contract.contract_id,
+                    details.contract.trading_class,
+                    details.contract.last_trade_date_or_contract_month,
+                    details.real_expiration_date,
+                    details.last_trade_time,
+                    details.time_zone_id,
+                    details.valid_exchanges,
+                    details.liquid_hours,
                 );
                 return Ok(None);
             }
