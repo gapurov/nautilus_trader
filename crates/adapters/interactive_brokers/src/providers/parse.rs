@@ -87,6 +87,7 @@ pub fn expiry_timestring_to_unix_nanos(
         anyhow::bail!("Invalid IBKR derivative expiration timestamp '{expiry}'");
     }
 
+    let spxw_last_trade_time;
     let (date, time, timezone) = if let Some(time) = explicit_time {
         let timezone = explicit_timezone
             .or_else(|| {
@@ -118,7 +119,6 @@ pub fn expiry_timestring_to_unix_nanos(
         }
 
         let time = details.last_trade_time.trim();
-        let spxw_last_trade_time;
         if time.is_empty() {
             let real_expiration_date = details.real_expiration_date.trim();
             let is_standard_us_equity_option = details.contract.security_type
