@@ -62,7 +62,8 @@ pub fn tick_size_to_precision(tick_size: f64) -> u8 {
 /// Explicit timestamps use their timezone token, or `ContractDetails.time_zone_id` when omitted.
 /// Date-only values require `ContractDetails.last_trade_time` and `time_zone_id`. Standard U.S.
 /// equity options may omit `last_trade_time`; when the last-trade and real-expiration dates agree,
-/// they use the OCC expiration time of 23:59 Eastern.
+/// they use the OCC expiration time of 23:59 Eastern. Qualified SPXW index options use the close
+/// from their expiration-date `ContractDetails.liquid_hours` entry.
 ///
 /// # Errors
 ///
@@ -117,6 +118,7 @@ pub fn expiry_timestring_to_unix_nanos(
         }
 
         let time = details.last_trade_time.trim();
+        let spxw_last_trade_time;
         if time.is_empty() {
             let real_expiration_date = details.real_expiration_date.trim();
             let is_standard_us_equity_option = details.contract.security_type
@@ -127,9 +129,42 @@ pub fn expiry_timestring_to_unix_nanos(
             if is_standard_us_equity_option && real_expiration_date == date {
                 (real_expiration_date, "23:59", timezone)
             } else {
-                anyhow::bail!(
-                    "IBKR derivative last trade date '{date}' is missing ContractDetails.last_trade_time"
-                );
+                let is_spxw_index_option = details.contract.security_type == SecurityType::Option
+                    && details.contract.currency.as_str() == "USD"
+                    && details.contract.trading_class == "SPXW"
+                    && details.contract.local_symbol.split_whitespace().next() == Some("SPXW")
+                    && details.under_symbol == "SPX"
+                    && details.under_security_type == "IND"
+                    && details
+                        .valid_exchanges
+                        .iter()
+                        .any(|exchange| exchange == "CBOE")
+                    && real_expiration_date == date;
+                let calendar_prefix = format!("{date}:");
+                let mut calendar_entries = details
+                    .liquid_hours
+                    .iter()
+                    .filter_map(|hours| hours.strip_prefix(&calendar_prefix));
+                let calendar_entry = calendar_entries.next();
+                let has_multiple_entries = calendar_entries.next().is_some();
+                let close_time = calendar_entry
+                    .filter(|_| is_spxw_index_option && !has_multiple_entries)
+                    .filter(|hours| *hours != "CLOSED")
+                    .and_then(|hours| hours.rsplit(',').next())
+                    .and_then(|hours| hours.rsplit_once('-').map(|(_, close)| close))
+                    .and_then(|close| close.strip_prefix(date))
+                    .and_then(|close| close.strip_prefix(':'))
+                    .filter(|close| {
+                        close.len() == 4 && close.bytes().all(|byte| byte.is_ascii_digit())
+                    });
+                if let Some(close_time) = close_time {
+                    spxw_last_trade_time = format!("{}:{}", &close_time[..2], &close_time[2..]);
+                    (date, spxw_last_trade_time.as_str(), timezone)
+                } else {
+                    anyhow::bail!(
+                        "IBKR derivative last trade date '{date}' is missing ContractDetails.last_trade_time"
+                    );
+                }
             }
         } else {
             (date, time, timezone)
@@ -588,31 +623,48 @@ mod tests {
     fn test_parse_option_contract_prefixes_index_underlying() {
         let details = ContractDetails {
             contract: Contract {
-                symbol: Symbol::from("SPXW"),
+                symbol: Symbol::from("SPX"),
                 security_type: SecurityType::Option,
                 exchange: Exchange::from("SMART"),
                 currency: Currency::from("USD"),
-                local_symbol: "SPXW  260313P06630000".to_string(),
-                last_trade_date_or_contract_month: "20260313".to_string(),
-                right: Some(OptionRight::Put),
-                strike: 6630.0,
+                local_symbol: "SPXW  260827C07740000".to_string(),
+                trading_class: "SPXW".to_string(),
+                last_trade_date_or_contract_month: "20260827".to_string(),
+                right: Some(OptionRight::Call),
+                strike: 7740.0,
                 multiplier: "100".to_string(),
                 ..Default::default()
             },
             min_tick: 0.05,
             under_symbol: "SPX".to_string(),
             under_security_type: "IND".to_string(),
-            real_expiration_date: "20260313".to_string(),
-            last_trade_time: "16:00:00".to_string(),
+            valid_exchanges: vec!["SMART".to_string(), "CBOE".to_string()],
+            real_expiration_date: "20260827".to_string(),
+            last_trade_time: String::new(),
             time_zone_id: "US/Eastern".to_string(),
+            liquid_hours: vec!["20260827:0930-20260827:1600".to_string()],
             ..Default::default()
         };
         let instrument_id = InstrumentId::new(
-            NautilusSymbol::from("SPXW  260313P06630000"),
-            Venue::from("SMART"),
+            NautilusSymbol::from("SPXW  260827C07740000"),
+            Venue::from("OPRA"),
         );
 
         let instrument = parse_ib_contract_to_instrument(&details, instrument_id).unwrap();
+        let mut half_day = details.clone();
+        half_day.contract.local_symbol = "SPXW  261127C07740000".to_string();
+        half_day.contract.last_trade_date_or_contract_month = "20261127".to_string();
+        half_day.real_expiration_date = "20261127".to_string();
+        half_day.liquid_hours = vec!["20261127:0930-20261127:1300".to_string()];
+        let half_day_id = InstrumentId::new(
+            NautilusSymbol::from("SPXW  261127C07740000"),
+            Venue::from("OPRA"),
+        );
+        let half_day_instrument = parse_ib_contract_to_instrument(&half_day, half_day_id).unwrap();
+        let mut ambiguous_spxw = details;
+        ambiguous_spxw.contract.trading_class.clear();
+        let ambiguous_error =
+            parse_ib_contract_to_instrument(&ambiguous_spxw, instrument_id).unwrap_err();
 
         let InstrumentAny::OptionContract(option) = instrument else {
             panic!("expected option contract");
@@ -621,9 +673,14 @@ mod tests {
         assert_eq!(option.asset_class(), AssetClass::Index);
         assert_eq!(
             option.expiration_ns(),
-            Some(UnixNanos::from(1_773_432_000_000_000_000))
+            Some(UnixNanos::from(1_787_860_800_000_000_000))
         );
         assert_eq!(option.underlying(), Some(Ustr::from("^SPX")));
+        assert_eq!(
+            half_day_instrument.expiration_ns(),
+            Some(UnixNanos::from(1_795_802_400_000_000_000))
+        );
+        assert!(format!("{ambiguous_error:#}").contains("missing ContractDetails.last_trade_time"));
     }
 
     #[rstest]
