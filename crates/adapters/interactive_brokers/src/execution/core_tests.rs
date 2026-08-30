@@ -916,6 +916,51 @@ fn sync_submit_instruments_from_cache_adds_late_instrument() {
 }
 
 #[rstest]
+fn sync_submit_instruments_from_cache_accepts_date_only_spxw_option() {
+    let (client, _, cache) = create_test_execution_client();
+    let instrument_id =
+        InstrumentId::new(Symbol::from("SPXW  270115C06000000"), Venue::from("OPRA"));
+    let details = ContractDetails {
+        contract: Contract {
+            contract_id: 7_740_000,
+            symbol: IBSymbol::from("SPX"),
+            security_type: SecurityType::Option,
+            exchange: Exchange::from("SMART"),
+            currency: IBCurrency::from("USD"),
+            local_symbol: String::from("SPXW  270115C06000000"),
+            trading_class: String::from("SPXW"),
+            last_trade_date_or_contract_month: String::from("20270115"),
+            right: Some(OptionRight::Call),
+            strike: 6000.0,
+            multiplier: String::from("100"),
+            ..Default::default()
+        },
+        min_tick: 0.05,
+        under_symbol: String::from("SPX"),
+        under_security_type: String::from("IND"),
+        real_expiration_date: String::from("20270115"),
+        last_trade_time: String::new(),
+        time_zone_id: String::new(),
+        trading_hours: Vec::new(),
+        liquid_hours: Vec::new(),
+        ..Default::default()
+    };
+    let instrument = parse_ib_contract_to_instrument(&details, instrument_id).unwrap();
+    cache.borrow_mut().add_instrument(instrument).unwrap();
+
+    client
+        .sync_submit_instruments_from_cache([instrument_id])
+        .unwrap();
+
+    let contract = client
+        .instrument_provider
+        .resolve_contract_for_instrument(instrument_id)
+        .unwrap();
+    assert_eq!(contract.contract_id, 7_740_000);
+    assert_eq!(contract.last_trade_date_or_contract_month, "20270115");
+}
+
+#[rstest]
 fn sync_submit_instruments_from_cache_rejects_missing_instrument() {
     let (client, _, _) = create_test_execution_client();
     let instrument_id = InstrumentId::from("AAPL.XNAS");

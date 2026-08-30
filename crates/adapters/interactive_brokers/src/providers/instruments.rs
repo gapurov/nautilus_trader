@@ -2882,23 +2882,29 @@ mod tests {
     }
 
     fn opra_option_contract_details(mut contract: Contract) -> ibapi::contracts::ContractDetails {
-        contract.contract_id = 12_345;
-        contract.symbol = ibapi::contracts::Symbol::from("AAPL");
+        contract.contract_id = 7_740_000;
+        contract.symbol = ibapi::contracts::Symbol::from("SPX");
         contract.security_type = SecurityType::Option;
         contract.exchange = Exchange::from("SMART");
         contract.currency = ibapi::contracts::Currency::from("USD");
-        contract.local_symbol = "AAPL  270115P00155000".to_string();
+        contract.local_symbol = "SPXW  270115C06000000".to_string();
+        contract.trading_class = "SPXW".to_string();
         contract.last_trade_date_or_contract_month = "20270115".to_string();
-        contract.strike = 155.0;
-        contract.right = Some(ibapi::contracts::OptionRight::Put);
+        contract.strike = 6000.0;
+        contract.right = Some(ibapi::contracts::OptionRight::Call);
         contract.multiplier = "100".to_string();
 
         ibapi::contracts::ContractDetails {
             contract,
-            min_tick: 0.01,
-            under_symbol: "AAPL".to_string(),
-            under_security_type: "STK".to_string(),
+            min_tick: 0.05,
+            under_symbol: "SPX".to_string(),
+            under_security_type: "IND".to_string(),
             valid_exchanges: vec!["SMART".to_string(), "CBOE".to_string()],
+            real_expiration_date: "20270115".to_string(),
+            last_trade_time: String::new(),
+            time_zone_id: String::new(),
+            trading_hours: Vec::new(),
+            liquid_hours: Vec::new(),
             ..Default::default()
         }
     }
@@ -2910,14 +2916,14 @@ mod tests {
     #[rstest]
     fn test_qualified_opra_details_preserve_canonical_instrument_identity() {
         let provider = InteractiveBrokersInstrumentProvider::new(Default::default());
-        let requested_id = InstrumentId::from("AAPL  270115P00155000.OPRA");
+        let requested_id = InstrumentId::from("SPXW  270115C06000000.OPRA");
         let request = instrument_id_to_ib_contract(requested_id, None).unwrap();
 
         assert_eq!(request.security_type, SecurityType::Option);
         assert_eq!(request.exchange.as_str(), "SMART");
         assert!(request.symbol.as_str().is_empty());
         assert_eq!(request.currency.as_str(), "USD");
-        assert_eq!(request.local_symbol, "AAPL  270115P00155000");
+        assert_eq!(request.local_symbol, "SPXW  270115C06000000");
         assert!(request.last_trade_date_or_contract_month.is_empty());
         assert!(request.right.is_none());
         assert_eq!(request.strike, 0.0);
@@ -2931,7 +2937,7 @@ mod tests {
         assert_eq!(loaded_id, requested_id);
         assert_eq!(provider.count(), 1);
         assert_eq!(
-            provider.get_instrument_id_by_contract_id(12_345),
+            provider.get_instrument_id_by_contract_id(7_740_000),
             Some(requested_id)
         );
         assert_eq!(
@@ -2949,14 +2955,14 @@ mod tests {
         assert_eq!(option.id.venue.as_str(), "OPRA");
         assert!(
             provider
-                .find(&InstrumentId::from("AAPL  270115P00155000.SMART"))
+                .find(&InstrumentId::from("SPXW  270115C06000000.SMART"))
                 .is_none()
         );
 
         let cached_contract = provider
             .instrument_id_to_ib_contract(&requested_id)
             .unwrap();
-        assert_eq!(cached_contract.contract_id, 12_345);
+        assert_eq!(cached_contract.contract_id, 7_740_000);
         assert_eq!(cached_contract.security_type, SecurityType::Option);
         assert_eq!(cached_contract.exchange.as_str(), "SMART");
 
@@ -2968,7 +2974,7 @@ mod tests {
         let cached_details = provider
             .instrument_id_to_ib_contract_details(&requested_id)
             .unwrap();
-        assert_eq!(cached_details.contract.contract_id, 12_345);
+        assert_eq!(cached_details.contract.contract_id, 7_740_000);
         assert_eq!(
             cached_details.valid_exchanges,
             vec!["SMART".to_string(), "CBOE".to_string()]
