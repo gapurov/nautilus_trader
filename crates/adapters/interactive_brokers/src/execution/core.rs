@@ -375,6 +375,11 @@ impl InteractiveBrokersExecutionClient {
         mass_status
     }
 
+    // IB can retain expired contracts as zero-quantity position rows
+    fn reportable_position_quantity(position: f64) -> Option<Decimal> {
+        Decimal::from_f64_retain(position).filter(|quantity| !quantity.is_zero())
+    }
+
     fn append_historical_fill_report(
         &self,
         cmd: &GenerateFillReports,
@@ -1155,6 +1160,12 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                             continue;
                         }
 
+                        let Some(position_qty) =
+                            Self::reportable_position_quantity(position.position)
+                        else {
+                            continue;
+                        };
+
                         let instrument = match self
                             .instrument_provider
                             .get_instrument(client.as_arc().as_ref(), &position.contract)
@@ -1184,8 +1195,6 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                             continue;
                         }
 
-                        let position_qty =
-                            Decimal::from_f64_retain(position.position).unwrap_or_default();
                         let open_fills = open_order_fills
                             .get(&instrument_id)
                             .copied()
@@ -1283,6 +1292,11 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         continue;
                     }
 
+                    let Some(position_qty) = Self::reportable_position_quantity(position.position)
+                    else {
+                        continue;
+                    };
+
                     let instrument = match self
                         .instrument_provider
                         .get_instrument(client.as_arc().as_ref(), &position.contract)
@@ -1314,9 +1328,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     }
 
                     // Determine position side
-                    let position_side = if position.position == 0.0 {
-                        PositionSideSpecified::Flat
-                    } else if position.position > 0.0 {
+                    let position_side = if position_qty > Decimal::ZERO {
                         PositionSideSpecified::Long
                     } else {
                         PositionSideSpecified::Short

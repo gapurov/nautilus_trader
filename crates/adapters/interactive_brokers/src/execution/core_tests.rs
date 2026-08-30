@@ -987,6 +987,18 @@ fn build_mass_status_sets_bounded_incomplete_report_contract() {
 }
 
 #[rstest]
+fn reportable_position_quantity_skips_flat_ib_snapshot() {
+    assert_eq!(
+        InteractiveBrokersExecutionClient::reportable_position_quantity(0.0),
+        None,
+    );
+    assert_eq!(
+        InteractiveBrokersExecutionClient::reportable_position_quantity(1.0),
+        Some(Decimal::ONE),
+    );
+}
+
+#[rstest]
 fn modify_order_rejects_when_client_not_ready() {
     let (client, mut rx, _) = create_test_execution_client();
     let order = create_test_limit_order(ClientOrderId::from("O-IB-001"));
