@@ -30,9 +30,11 @@ use redis::{Cmd, ErrorKind, FromRedisValue, ServerErrorKind, aio::ConnectionMana
 use thiserror::Error;
 
 const ROLLING_WINDOW_MS: u64 = 60_000;
+const CONCURRENCY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 const BOOTSTRAP_SCRIPT: &str = include_str!("../resources/bootstrap.lua");
 const ADMIT_SCRIPT: &str = include_str!("../resources/admit.lua");
+const RENEW_SCRIPT: &str = include_str!("../resources/renew.lua");
 const RELEASE_SCRIPT: &str = include_str!("../resources/release.lua");
 const RECONCILE_SCRIPT: &str = include_str!("../resources/reconcile.lua");
 const RECONNECT_SCRIPT: &str = include_str!("../resources/reconnect.lua");
@@ -171,6 +173,7 @@ impl LoadedScript {
 struct Scripts {
     bootstrap: LoadedScript,
     admit: LoadedScript,
+    renew: LoadedScript,
     release: LoadedScript,
     reconcile: LoadedScript,
     reconnect: LoadedScript,
@@ -181,6 +184,7 @@ impl Scripts {
         Self {
             bootstrap: LoadedScript::new(BOOTSTRAP_SCRIPT),
             admit: LoadedScript::new(ADMIT_SCRIPT),
+            renew: LoadedScript::new(RENEW_SCRIPT),
             release: LoadedScript::new(RELEASE_SCRIPT),
             reconcile: LoadedScript::new(RECONCILE_SCRIPT),
             reconnect: LoadedScript::new(RECONNECT_SCRIPT),
@@ -190,6 +194,7 @@ impl Scripts {
     async fn load_all(&self, connection: &mut ConnectionManager) -> redis::RedisResult<()> {
         self.bootstrap.load(connection).await?;
         self.admit.load(connection).await?;
+        self.renew.load(connection).await?;
         self.release.load(connection).await?;
         self.reconcile.load(connection).await?;
         self.reconnect.load(connection).await?;
@@ -299,12 +304,30 @@ impl DragonflyGate {
         self.inner.healthy.load(Ordering::Acquire)
     }
 
-    /// Atomically admits one HTTP attempt.
+    /// Waits for account-wide availability and atomically admits one HTTP attempt.
+    ///
+    /// Returns a denial only when the UTC daily request budget is exhausted.
     ///
     /// # Errors
     ///
     /// Returns an error when Dragonfly is unavailable or the pinned coordination epoch changed.
     pub async fn admit_http(&self) -> Result<AdmissionDecision, CoordinationError> {
+        loop {
+            match self.try_admit_http().await? {
+                AdmissionDecision::Denied {
+                    kind: AdmissionDeniedKind::ConcurrencyLimit,
+                    retry_after,
+                } => tokio::time::sleep(retry_after.min(CONCURRENCY_POLL_INTERVAL)).await,
+                AdmissionDecision::Denied {
+                    kind: AdmissionDeniedKind::GlobalBlock | AdmissionDeniedKind::MinuteLimit,
+                    retry_after,
+                } => tokio::time::sleep(retry_after).await,
+                decision => return Ok(decision),
+            }
+        }
+    }
+
+    async fn try_admit_http(&self) -> Result<AdmissionDecision, CoordinationError> {
         let lease_id = UUID4::new().to_string();
         let mut connection = self.inner.connection.clone();
         let result: (i64, i64, i64, i64, i64, i64) = self
@@ -374,7 +397,8 @@ impl DragonflyGate {
                     .arg(observation.requests_per_minute_reset_ms.unwrap_or(0))
                     .arg(i32::from(observation.success))
                     .arg(i32::from(observation.concurrent_limit_exceeded))
-                    .arg(self.inner.concurrent_requests);
+                    .arg(self.inner.concurrent_requests)
+                    .arg(ROLLING_WINDOW_MS);
             })
             .await
             .map_err(|_| self.unavailable())?;
@@ -414,6 +438,34 @@ impl DragonflyGate {
             1 => Ok(Some(Duration::from_millis(nonnegative_u64(result.1)))),
             2 => Err(self.state_reset()),
             _ => Err(self.unavailable()),
+        }
+    }
+
+    async fn renew_lease(&self, lease_id: &str) -> Result<(), CoordinationError> {
+        let mut connection = self.inner.connection.clone();
+        let renewed: i64 = self
+            .inner
+            .scripts
+            .renew
+            .invoke(&mut connection, |command| {
+                command
+                    .arg(2)
+                    .arg(&self.inner.keys.sentinel)
+                    .arg(&self.inner.keys.leases)
+                    .arg(&self.inner.epoch)
+                    .arg(lease_id)
+                    .arg(self.inner.lease_ttl_ms);
+            })
+            .await
+            .map_err(|_| self.unavailable())?;
+
+        match renewed {
+            1 => {
+                self.inner.healthy.store(true, Ordering::Release);
+                Ok(())
+            }
+            0 => Err(self.unavailable()),
+            _ => Err(self.state_reset()),
         }
     }
 
@@ -475,6 +527,24 @@ impl AdmissionLease {
     #[must_use]
     pub const fn admitted_at_ms(&self) -> i64 {
         self.admitted_at_ms
+    }
+
+    /// Returns the interval for renewing this lease while transport is active.
+    #[must_use]
+    pub fn renewal_interval(&self) -> Duration {
+        Duration::from_millis((self.gate.inner.lease_ttl_ms / 3).max(1))
+    }
+
+    /// Extends this active lease from Dragonfly's current time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lease was released, lost, or coordination failed.
+    pub async fn renew(&self) -> Result<(), CoordinationError> {
+        if self.released.load(Ordering::Acquire) {
+            return Err(CoordinationError::Unavailable);
+        }
+        self.gate.renew_lease(&self.lease_id).await
     }
 
     /// Releases account-wide concurrency immediately.
@@ -624,7 +694,7 @@ mod tests {
     #[ignore = "requires UNUSUAL_WHALES_DRAGONFLY_TEST_URL"]
     async fn dragonfly_concurrent_admission_is_atomic() {
         let (gate, _) = integration_gate(10, 1, 10, Duration::from_secs(1)).await;
-        let (first, second) = tokio::join!(gate.admit_http(), gate.admit_http());
+        let (first, second) = tokio::join!(gate.try_admit_http(), gate.try_admit_http());
         let mut lease = None;
         let mut denied = 0;
 
@@ -647,11 +717,59 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires UNUSUAL_WHALES_DRAGONFLY_TEST_URL"]
+    async fn fourth_caller_waits_until_one_of_three_leases_releases() {
+        let (gate, _) = integration_gate(10, 3, 10, Duration::from_secs(1)).await;
+        let first = admitted(&gate).await;
+        let second = admitted(&gate).await;
+        let third = admitted(&gate).await;
+        let waiting_gate = gate.clone();
+        let fourth = tokio::spawn(async move { waiting_gate.admit_http().await });
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert!(!fourth.is_finished());
+        first.release().await.unwrap();
+
+        let fourth = tokio::time::timeout(Duration::from_millis(500), fourth)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let fourth = match fourth {
+            AdmissionDecision::Admitted(lease) => lease,
+            decision => panic!("expected admission after release, was {decision:?}"),
+        };
+        fourth.release().await.unwrap();
+        second.release().await.unwrap();
+        third.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires UNUSUAL_WHALES_DRAGONFLY_TEST_URL"]
+    async fn renewed_lease_remains_active_beyond_its_original_expiry() {
+        let (gate, _) = integration_gate(10, 1, 10, Duration::from_secs(1)).await;
+        let lease = admitted(&gate).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        lease.renew().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        assert!(matches!(
+            gate.try_admit_http().await.unwrap(),
+            AdmissionDecision::Denied {
+                kind: AdmissionDeniedKind::ConcurrencyLimit,
+                ..
+            }
+        ));
+        lease.release().await.unwrap();
+        admitted(&gate).await.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires UNUSUAL_WHALES_DRAGONFLY_TEST_URL"]
     async fn dragonfly_rolling_minute_and_daily_budgets_are_enforced() {
         let (minute_gate, _) = integration_gate(1, 1, 10, Duration::from_secs(1)).await;
         admitted(&minute_gate).await.release().await.unwrap();
         assert!(matches!(
-            minute_gate.admit_http().await.unwrap(),
+            minute_gate.try_admit_http().await.unwrap(),
             AdmissionDecision::Denied {
                 kind: AdmissionDeniedKind::MinuteLimit,
                 ..
@@ -661,7 +779,7 @@ mod tests {
         let (daily_gate, _) = integration_gate(10, 1, 1, Duration::from_secs(1)).await;
         admitted(&daily_gate).await.release().await.unwrap();
         assert!(matches!(
-            daily_gate.admit_http().await.unwrap(),
+            daily_gate.try_admit_http().await.unwrap(),
             AdmissionDecision::Denied {
                 kind: AdmissionDeniedKind::DailyBudget,
                 ..
@@ -675,7 +793,7 @@ mod tests {
         let (gate, _) = integration_gate(2, 1, 2, Duration::from_secs(1)).await;
         let first = admitted(&gate).await;
         assert!(matches!(
-            gate.admit_http().await.unwrap(),
+            gate.try_admit_http().await.unwrap(),
             AdmissionDecision::Denied {
                 kind: AdmissionDeniedKind::ConcurrencyLimit,
                 ..
@@ -684,7 +802,7 @@ mod tests {
         first.release().await.unwrap();
         admitted(&gate).await.release().await.unwrap();
         assert!(matches!(
-            gate.admit_http().await.unwrap(),
+            gate.try_admit_http().await.unwrap(),
             AdmissionDecision::Denied {
                 kind: AdmissionDeniedKind::MinuteLimit,
                 ..
@@ -708,15 +826,15 @@ mod tests {
         let (gate, _) = integration_gate(10, 1, 10, Duration::from_secs(1)).await;
         let first = admitted(&gate).await;
         let reset = first.admitted_at_ms() + 60_000;
-        gate.reconcile_response(ResponseObservation {
+        let observation = ResponseObservation {
             minute_request_counter: Some(1),
             requests_per_minute_remaining: Some(4),
             requests_per_minute_reset_ms: Some(reset),
             success: true,
             ..Default::default()
-        })
-        .await
-        .unwrap();
+        };
+        gate.reconcile_response(observation).await.unwrap();
+        gate.reconcile_response(observation).await.unwrap();
         first.release().await.unwrap();
         for _ in 0..4 {
             admitted(&gate).await.release().await.unwrap();
@@ -731,7 +849,7 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            gate.admit_http().await.unwrap(),
+            gate.try_admit_http().await.unwrap(),
             AdmissionDecision::Denied {
                 kind: AdmissionDeniedKind::MinuteLimit,
                 ..
@@ -755,7 +873,7 @@ mod tests {
             .unwrap();
         lease.release().await.unwrap();
         assert!(matches!(
-            zero_gate.admit_http().await.unwrap(),
+            zero_gate.try_admit_http().await.unwrap(),
             AdmissionDecision::Denied {
                 kind: AdmissionDeniedKind::GlobalBlock,
                 ..
@@ -773,12 +891,46 @@ mod tests {
             .unwrap();
         lease.release().await.unwrap();
         assert!(matches!(
-            rate_gate.admit_http().await.unwrap(),
+            rate_gate.try_admit_http().await.unwrap(),
             AdmissionDecision::Denied {
                 kind: AdmissionDeniedKind::GlobalBlock,
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires UNUSUAL_WHALES_DRAGONFLY_TEST_URL"]
+    async fn impossible_stored_minute_reset_is_cleared() {
+        let (gate, url) = integration_gate(10, 1, 10, Duration::from_secs(1)).await;
+        let lease = admitted(&gate).await;
+        let impossible_reset = lease.admitted_at_ms() + 60_000_000;
+        let client = redis::Client::open(url).unwrap();
+        let mut connection = client.get_connection_manager().await.unwrap();
+        redis::cmd("HSET")
+            .arg(&gate.inner.keys.state)
+            .arg("observed_minute_limit")
+            .arg(1)
+            .arg("observed_minute_used")
+            .arg(1)
+            .arg("observed_minute_reset_ms")
+            .arg(impossible_reset)
+            .arg("blocked_until_ms")
+            .arg(impossible_reset)
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
+        lease.release().await.unwrap();
+
+        let decision = tokio::time::timeout(Duration::from_millis(500), gate.admit_http())
+            .await
+            .unwrap()
+            .unwrap();
+        let lease = match decision {
+            AdmissionDecision::Admitted(lease) => lease,
+            decision => panic!("expected admission after reset repair, was {decision:?}"),
+        };
+        lease.release().await.unwrap();
     }
 
     #[tokio::test]
@@ -800,7 +952,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            gate.admit_http().await.unwrap_err(),
+            gate.try_admit_http().await.unwrap_err(),
             CoordinationError::StateReset
         );
     }

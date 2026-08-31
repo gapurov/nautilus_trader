@@ -12,11 +12,25 @@ local observed_reset_ms = tonumber(ARGV[5])
 local success = tonumber(ARGV[6])
 local concurrency_exceeded = tonumber(ARGV[7])
 local configured_concurrency = tonumber(ARGV[8])
+local window_ms = tonumber(ARGV[9])
 
 redis.call("ZREMRANGEBYSCORE", KEYS[2], "-inf", now_ms)
 
 local current_reset = tonumber(redis.call("HGET", KEYS[3], "observed_minute_reset_ms") or "0")
-if current_reset > 0 and current_reset <= now_ms then
+local current_block = tonumber(redis.call("HGET", KEYS[3], "blocked_until_ms") or "0")
+if current_reset > now_ms + window_ms then
+    redis.call(
+        "HDEL",
+        KEYS[3],
+        "observed_minute_limit",
+        "observed_minute_used",
+        "observed_minute_reset_ms"
+    )
+    if current_block == current_reset then
+        redis.call("HDEL", KEYS[3], "blocked_until_ms")
+    end
+    current_reset = 0
+elseif current_reset > 0 and current_reset <= now_ms then
     redis.call(
         "HDEL",
         KEYS[3],
@@ -27,7 +41,7 @@ if current_reset > 0 and current_reset <= now_ms then
     current_reset = 0
 end
 
-if observed_reset_ms > now_ms then
+if observed_reset_ms > now_ms and observed_reset_ms <= now_ms + window_ms then
     if current_reset == 0 then
         current_reset = observed_reset_ms
         redis.call("HSET", KEYS[3], "observed_minute_reset_ms", current_reset)
@@ -63,8 +77,8 @@ if concurrency_exceeded == 1 then
     end
 else
     local block_until = retry_after_until_ms
-    if success == 1 and observed_remaining == 0 and observed_reset_ms > block_until then
-        block_until = observed_reset_ms
+    if success == 1 and observed_remaining == 0 and current_reset > block_until then
+        block_until = current_reset
     end
     if block_until > now_ms then
         local current_block = tonumber(redis.call("HGET", KEYS[3], "blocked_until_ms") or "0")
@@ -75,4 +89,3 @@ else
 end
 
 return {1, now_ms}
-
