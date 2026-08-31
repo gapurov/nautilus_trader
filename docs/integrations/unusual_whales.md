@@ -45,6 +45,12 @@ Dragonfly is the account-wide authority for these controls:
 - Observed minute and concurrency limits.
 - WebSocket connection starts.
 
+Transient global, rolling-minute, and concurrency contention waits inside the native gate and does
+not consume an HTTP retry or produce a provider `RateLimited` result. Concurrency leases are renewed
+while transport is active and released on every terminal path. Daily budget exhaustion is returned
+as a terminal value without starting HTTP. The UW minute-reset header is a relative millisecond
+duration; generic reset headers retain their documented seconds or epoch semantics.
+
 All keys contain the full BLAKE3 hash of the REST base URL and API token in one hash tag. The token
 is not stored in a key and is not logged.
 

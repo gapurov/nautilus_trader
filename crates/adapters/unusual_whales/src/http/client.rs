@@ -122,6 +122,10 @@ impl UnusualWhalesHttpClient {
             parsed.username().is_empty() && parsed.password().is_none(),
             "Unusual Whales base_url cannot contain credentials"
         );
+        anyhow::ensure!(
+            config.lease_ttl_secs > config.http_timeout_secs,
+            "lease_ttl_secs must exceed http_timeout_secs"
+        );
 
         let mut headers = HashMap::new();
         headers.insert(
@@ -146,7 +150,7 @@ impl UnusualWhalesHttpClient {
             max_delay_ms: config.retry_delay_max_ms,
             backoff_factor: 2.0,
             jitter_ms: 100,
-            operation_timeout_ms: Some(config.http_timeout_secs.saturating_mul(1_000)),
+            operation_timeout_ms: None,
             immediate_first: false,
             max_elapsed_ms: None,
         });
@@ -174,10 +178,7 @@ impl UnusualWhalesHttpClient {
                 || {
                     let attempts = Arc::clone(&attempts);
                     let request = request.clone();
-                    async move {
-                        attempts.fetch_add(1, Ordering::Relaxed);
-                        self.attempt(&request).await
-                    }
+                    async move { self.attempt(&request, &attempts).await }
                 },
                 |failure| failure.retryable,
                 |failure| failure.retry_after,
@@ -208,6 +209,7 @@ impl UnusualWhalesHttpClient {
     async fn attempt(
         &self,
         request: &ValidatedRestRequest,
+        attempts: &AtomicU32,
     ) -> Result<AttemptPayload, AttemptFailure> {
         let lease = match self.gate.admit_http().await {
             Ok(AdmissionDecision::Admitted(lease)) => lease,
@@ -216,16 +218,30 @@ impl UnusualWhalesHttpClient {
             }
             Err(e) => return Err(coordination_failure(e)),
         };
+        attempts.fetch_add(1, Ordering::Relaxed);
 
         let url = format!("{}{}", self.base_url, request.relative_url);
         let response = self
             .client
-            .request(Method::GET, url, None, None, None, None, None)
-            .await;
+            .request(Method::GET, url, None, None, None, None, None);
+        tokio::pin!(response);
+        let response = loop {
+            let renewal = tokio::time::sleep(lease.renewal_interval());
+            tokio::pin!(renewal);
+            tokio::select! {
+                response = &mut response => break response,
+                () = &mut renewal => {
+                    if let Err(error) = lease.renew().await {
+                        let _ = lease.release().await;
+                        return Err(coordination_failure(error));
+                    }
+                }
+            }
+        };
 
         match response {
             Ok(response) => {
-                let observation = response_observation(&response, lease.admitted_at_ms());
+                let observation = response_observation(&response, unix_time_ms());
                 let coordination = self.gate.reconcile_response(observation).await;
                 let release = lease.release().await;
                 if let Err(e) = coordination.and(release) {
@@ -306,10 +322,11 @@ fn response_payload(
     }
 }
 
-fn response_observation(response: &HttpResponse, admitted_at_ms: i64) -> ResponseObservation {
+fn response_observation(response: &HttpResponse, received_at_ms: i64) -> ResponseObservation {
     let headers = rate_headers(&response.headers);
     let json = serde_json::from_slice::<Value>(&response.body).ok();
     let concurrent_limit_exceeded = json.as_ref().is_some_and(contains_concurrency_error);
+    let provider_rate_limited = response.status.as_u16() == 429 && !concurrent_limit_exceeded;
     let minute_request_counter = headers
         .minute_request_counter
         .as_deref()
@@ -321,11 +338,16 @@ fn response_observation(response: &HttpResponse, admitted_at_ms: i64) -> Respons
     let requests_per_minute_reset_ms = headers
         .requests_per_minute_reset
         .as_deref()
-        .or(headers.rate_limit_reset.as_deref())
-        .and_then(|value| parse_reset_ms(value, admitted_at_ms))
+        .and_then(|value| parse_uw_reset_ms(value, received_at_ms))
+        .or_else(|| {
+            headers
+                .rate_limit_reset
+                .as_deref()
+                .and_then(|value| parse_generic_reset_ms(value, received_at_ms))
+        })
         .or_else(|| {
             (minute_request_counter.is_some() || requests_per_minute_remaining.is_some())
-                .then(|| admitted_at_ms.saturating_add(60_000))
+                .then(|| received_at_ms.saturating_add(60_000))
         });
     ResponseObservation {
         retry_after_until_ms: if concurrent_limit_exceeded {
@@ -334,7 +356,15 @@ fn response_observation(response: &HttpResponse, admitted_at_ms: i64) -> Respons
             headers
                 .retry_after
                 .as_deref()
-                .and_then(|value| retry_after_until_ms(value, admitted_at_ms))
+                .and_then(|value| retry_after_until_ms(value, received_at_ms))
+                .or_else(|| {
+                    if provider_rate_limited {
+                        requests_per_minute_reset_ms
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| provider_rate_limited.then(|| received_at_ms.saturating_add(60_000)))
         },
         minute_request_counter,
         requests_per_minute_remaining,
@@ -403,7 +433,20 @@ fn parse_retry_after(value: &str, now_ms: i64) -> Option<Duration> {
     ))
 }
 
-fn parse_reset_ms(value: &str, now_ms: i64) -> Option<i64> {
+fn parse_uw_reset_ms(value: &str, now_ms: i64) -> Option<i64> {
+    let raw = value.trim().parse::<i64>().ok()?;
+    if raw <= 0 {
+        return None;
+    }
+
+    if raw >= 100_000_000_000 {
+        Some(raw)
+    } else {
+        now_ms.checked_add(raw)
+    }
+}
+
+fn parse_generic_reset_ms(value: &str, now_ms: i64) -> Option<i64> {
     let raw = value.trim().parse::<i64>().ok()?;
     if raw <= 0 {
         return None;
@@ -498,11 +541,24 @@ fn unix_time_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicU32, Ordering},
+        },
+        time::Duration,
+    };
 
     use bytes::Bytes;
+    use nautilus_core::UUID4;
     use nautilus_network::http::HttpStatus;
     use rstest::rstest;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        task::JoinHandle,
+    };
 
     use super::*;
 
@@ -515,6 +571,62 @@ mod tests {
                 .collect::<HashMap<_, _>>(),
             body: Bytes::copy_from_slice(body),
         }
+    }
+
+    async fn one_response_server() -> (String, Arc<AtomicU32>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicU32::new(0));
+        let server_requests = Arc::clone(&requests);
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            stream.read(&mut request).await.unwrap();
+            server_requests.fetch_add(1, Ordering::Relaxed);
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "content-type: application/json\r\n",
+                "content-length: 2\r\n",
+                "connection: close\r\n\r\n",
+                "{}",
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), requests, handle)
+    }
+
+    async fn integration_client(
+        base_url: String,
+        concurrent_requests: u32,
+        daily_request_limit: u32,
+    ) -> (UnusualWhalesHttpClient, DragonflyGate) {
+        let dragonfly_url = std::env::var("UNUSUAL_WHALES_DRAGONFLY_TEST_URL")
+            .expect("UNUSUAL_WHALES_DRAGONFLY_TEST_URL is required");
+        let config = UnusualWhalesDataClientConfig {
+            api_key: Some("test-token".to_string()),
+            base_url,
+            requests_per_minute: 100,
+            concurrent_requests,
+            daily_request_limit,
+            lease_ttl_secs: 2,
+            max_retries: 0,
+            http_timeout_secs: 1,
+            ..Default::default()
+        };
+        let credential = Credential::resolve(config.api_key.as_deref()).unwrap();
+        let gate = DragonflyGate::connect(
+            &dragonfly_url,
+            UUID4::new().as_str(),
+            config.requests_per_minute,
+            config.concurrent_requests,
+            config.daily_request_limit,
+            Duration::from_secs(config.lease_ttl_secs),
+            Duration::from_millis(config.reconnect_interval_ms),
+        )
+        .await
+        .unwrap();
+        let client = UnusualWhalesHttpClient::new(&config, &credential, gate.clone()).unwrap();
+        (client, gate)
     }
 
     #[rstest]
@@ -582,21 +694,42 @@ mod tests {
     }
 
     #[rstest]
-    fn zero_remaining_success_blocks_until_reset_observation() {
+    fn uw_minute_reset_is_relative_milliseconds() {
         let response = response(
             200,
             b"{}",
             &[
                 ("x-uw-minute-req-counter", "120"),
                 ("x-uw-req-per-minute-remaining", "0"),
-                ("x-uw-req-per-minute-reset", "30"),
+                ("x-uw-req-per-minute-reset", "60000"),
             ],
         );
         let observation = response_observation(&response, 1_000_000);
         assert!(observation.success);
         assert_eq!(observation.minute_request_counter, Some(120));
         assert_eq!(observation.requests_per_minute_remaining, Some(0));
+        assert_eq!(observation.requests_per_minute_reset_ms, Some(1_060_000));
+    }
+
+    #[rstest]
+    fn generic_reset_duration_is_relative_seconds() {
+        let response = response(200, b"{}", &[("x-ratelimit-reset", "30")]);
+        let observation = response_observation(&response, 1_000_000);
         assert_eq!(observation.requests_per_minute_reset_ms, Some(1_030_000));
+    }
+
+    #[rstest]
+    fn provider_rate_limit_without_retry_after_uses_uw_reset() {
+        let response = response(429, b"{}", &[("x-uw-req-per-minute-reset", "60000")]);
+        let observation = response_observation(&response, 1_000_000);
+        assert_eq!(observation.retry_after_until_ms, Some(1_060_000));
+    }
+
+    #[rstest]
+    fn provider_rate_limit_without_reset_uses_one_minute_fallback() {
+        let response = response(429, b"{}", &[]);
+        let observation = response_observation(&response, 1_000_000);
+        assert_eq!(observation.retry_after_until_ms, Some(1_060_000));
     }
 
     #[rstest]
@@ -628,5 +761,88 @@ mod tests {
             std::str::from_utf8(raw).ok()
         );
         assert_eq!(BASE64.decode(payload.response_body_base64).unwrap(), raw);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires UNUSUAL_WHALES_DRAGONFLY_TEST_URL"]
+    async fn concurrency_wait_does_not_consume_an_http_attempt() {
+        let (base_url, requests, server) = one_response_server().await;
+        let (client, gate) = integration_client(base_url, 1, 10).await;
+        let held_lease = match gate.admit_http().await.unwrap() {
+            AdmissionDecision::Admitted(lease) => lease,
+            decision => panic!("expected admission, was {decision:?}"),
+        };
+        let request =
+            crate::contract::validate_rest_request("PublicApi.MarketController.market_tide", None)
+                .unwrap();
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client
+                .request(request, UUID4::new().to_string())
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert!(!pending.is_finished());
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        held_lease.release().await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.outcome, UnusualWhalesOutcome::Success);
+        assert_eq!(result.attempts, 1);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        server.await.unwrap();
+        let released = match gate.try_admit_http().await.unwrap() {
+            AdmissionDecision::Admitted(lease) => lease,
+            decision => panic!("expected released concurrency, was {decision:?}"),
+        };
+        released.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires UNUSUAL_WHALES_DRAGONFLY_TEST_URL"]
+    async fn exhausted_daily_budget_returns_without_an_http_attempt() {
+        let (base_url, requests, server) = one_response_server().await;
+        let (client, gate) = integration_client(base_url, 1, 1).await;
+        let used_lease = match gate.admit_http().await.unwrap() {
+            AdmissionDecision::Admitted(lease) => lease,
+            decision => panic!("expected admission, was {decision:?}"),
+        };
+        used_lease.release().await.unwrap();
+        let request =
+            crate::contract::validate_rest_request("PublicApi.MarketController.market_tide", None)
+                .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            client.request(request, UUID4::new().to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, UnusualWhalesOutcome::RateLimited);
+        assert_eq!(result.attempts, 0);
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires UNUSUAL_WHALES_DRAGONFLY_TEST_URL"]
+    async fn transport_failure_releases_its_admission_lease() {
+        let (client, gate) = integration_client("http://127.0.0.1:9".to_string(), 1, 10).await;
+        let request =
+            crate::contract::validate_rest_request("PublicApi.MarketController.market_tide", None)
+                .unwrap();
+
+        let result = client.request(request, UUID4::new().to_string()).await;
+        assert_eq!(result.outcome, UnusualWhalesOutcome::TransportUnavailable);
+        assert_eq!(result.attempts, 1);
+        let released = match gate.try_admit_http().await.unwrap() {
+            AdmissionDecision::Admitted(lease) => lease,
+            decision => panic!("expected released concurrency, was {decision:?}"),
+        };
+        released.release().await.unwrap();
     }
 }
