@@ -38,8 +38,9 @@ use nautilus_common::{
     component::Component,
     enums::Environment,
     factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
-    live::dst,
+    live::{dst, runner::get_data_event_sender},
     messages::{
+        DataEvent,
         execution::{
             CancelOrder, GenerateOrderStatusReport, GenerateOrderStatusReports,
             GeneratePositionStatusReports, QueryOrder,
@@ -304,6 +305,7 @@ mod serial_tests {
         factory_trader_id: Arc<Mutex<Option<TraderId>>>,
         mass_status_requested: Arc<AtomicBool>,
         mass_status: Arc<Mutex<Option<ExecutionMassStatus>>>,
+        mass_status_instrument: Arc<Mutex<Option<InstrumentAny>>>,
         registered_external_orders: Arc<Mutex<Vec<ClientOrderId>>>,
         cancel_orders_received: Arc<AtomicUsize>,
         cancel_orders_while_connected: Arc<AtomicBool>,
@@ -836,6 +838,18 @@ mod serial_tests {
             self.state
                 .mass_status_requested
                 .store(true, Ordering::Relaxed);
+
+            if let Some(instrument) = self
+                .state
+                .mass_status_instrument
+                .lock()
+                .expect("mass status instrument lock poisoned")
+                .clone()
+            {
+                get_data_event_sender()
+                    .send(DataEvent::Instrument(instrument))
+                    .map_err(|e| anyhow::anyhow!("failed to publish test instrument: {e}"))?;
+            }
 
             match self.behavior {
                 StartupMassStatusBehavior::Available => Ok(self
@@ -2330,7 +2344,7 @@ mod serial_tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_startup_mass_status_registers_external_order_with_source_client() {
+    async fn test_startup_mass_status_caches_instrument_before_external_order() {
         let config = LiveNodeConfig {
             exec_engine: LiveExecutionEngineConfig {
                 reconciliation: true,
@@ -2368,6 +2382,11 @@ mod serial_tests {
             .mass_status
             .lock()
             .expect("mass status lock poisoned") = Some(mass_status);
+        *source_state
+            .mass_status_instrument
+            .lock()
+            .expect("mass status instrument lock poisoned") =
+            Some(InstrumentAny::CryptoPerpetual(instrument.clone()));
 
         let venue_factory = StartupMassStatusExecutionClientFactory::new(
             venue_state.clone(),
@@ -2402,13 +2421,15 @@ mod serial_tests {
             .unwrap()
             .build()
             .unwrap();
-        node.kernel()
-            .cache()
-            .borrow_mut()
-            .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
-            .unwrap();
-
         node.start().await.unwrap();
+
+        assert!(
+            node.kernel()
+                .cache()
+                .borrow()
+                .instrument(&instrument_id)
+                .is_some()
+        );
 
         assert_eq!(
             node.kernel()

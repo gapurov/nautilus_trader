@@ -53,9 +53,12 @@ use nautilus_common::{
     clients::ExecutionClient,
     enums::LogLevel,
     factories::OrderEventFactory,
-    live::{get_runtime, runner::get_exec_event_sender},
+    live::{
+        get_runtime,
+        runner::{get_exec_event_sender, try_get_data_event_sender},
+    },
     messages::{
-        ExecutionEvent,
+        DataEvent, ExecutionEvent,
         execution::{
             BatchCancelOrders, CancelAllOrders, CancelOrder, ExecutionReport, GenerateFillReports,
             GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -315,6 +318,33 @@ impl InteractiveBrokersExecutionClient {
             order_fill_progress: Arc::new(Mutex::new(AHashMap::new())),
             pending_cancel_orders: Arc::new(Mutex::new(ahash::AHashSet::new())),
         })
+    }
+
+    fn publish_report_instrument(instrument: &InstrumentAny) -> anyhow::Result<()> {
+        try_get_data_event_sender()
+            .context("Data event sender not initialized")?
+            .send(DataEvent::Instrument(instrument.clone()))
+            .map_err(|e| anyhow::anyhow!("Failed to publish IBKR report instrument: {e}"))
+    }
+
+    async fn resolve_and_publish_report_instrument(
+        &self,
+        contract: &Contract,
+    ) -> anyhow::Result<InstrumentAny> {
+        let client = self.ib_client.as_ref().context("IB client not connected")?;
+        let instrument = self
+            .instrument_provider
+            .get_instrument(client.as_arc().as_ref(), contract)
+            .await?
+            .with_context(|| {
+                format!(
+                    "IBKR contract {} did not resolve to an instrument",
+                    contract.contract_id
+                )
+            })?;
+
+        Self::publish_report_instrument(&instrument)?;
+        Ok(instrument)
     }
 
     fn submit_order_list_with_orders(
@@ -942,19 +972,10 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         }
 
                         let instrument = match self
-                            .instrument_provider
-                            .get_instrument(client.as_arc().as_ref(), &position.contract)
+                            .resolve_and_publish_report_instrument(&position.contract)
                             .await
                         {
-                            Ok(Some(instrument)) => instrument,
-                            Ok(None) => {
-                                tracing::warn!(
-                                    con_id = position.contract.contract_id,
-                                    sec_type = ?position.contract.security_type,
-                                    "Cannot generate synthetic order report: instrument not found",
-                                );
-                                continue;
-                            }
+                            Ok(instrument) => instrument,
                             Err(e) => {
                                 tracing::warn!(
                                     con_id = position.contract.contract_id,
@@ -1147,19 +1168,10 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     }
 
                     let instrument = match self
-                        .instrument_provider
-                        .get_instrument(client.as_arc().as_ref(), &position.contract)
+                        .resolve_and_publish_report_instrument(&position.contract)
                         .await
                     {
-                        Ok(Some(instrument)) => instrument,
-                        Ok(None) => {
-                            tracing::warn!(
-                                con_id = position.contract.contract_id,
-                                sec_type = ?position.contract.security_type,
-                                "Cannot generate position status report: instrument not found",
-                            );
-                            continue;
-                        }
+                        Ok(instrument) => instrument,
                         Err(e) => {
                             tracing::warn!(
                                 con_id = position.contract.contract_id,
