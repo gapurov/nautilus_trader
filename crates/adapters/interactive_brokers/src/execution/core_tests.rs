@@ -21,7 +21,11 @@ use ibapi::{
     },
     subscriptions::Subscription,
 };
-use nautilus_common::{cache::Cache, live::runner::replace_exec_event_sender};
+use nautilus_common::{
+    cache::Cache,
+    live::runner::{replace_data_event_sender, replace_exec_event_sender},
+    messages::DataEvent,
+};
 use nautilus_live::{ExecutionClientCore, execution::failure::CommandFailure};
 use nautilus_model::{
     enums::{AccountType, AssetClass, LiquiditySide, OmsType, OrderSide, OrderType},
@@ -1612,6 +1616,20 @@ fn test_parse_historical_fill_report_uses_provider_resolved_stock_venue() {
     assert_eq!(report.venue_order_id, VenueOrderId::from("123"));
     assert_eq!(report.last_qty, Quantity::from(10));
     assert_eq!(report.last_px, Price::from("150.25"));
+}
+
+#[rstest]
+fn test_publish_report_instrument_uses_data_event_path() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_data_event_sender(tx);
+    let instrument = InstrumentAny::from(equity_aapl());
+
+    InteractiveBrokersExecutionClient::publish_report_instrument(&instrument).unwrap();
+
+    let DataEvent::Instrument(published) = rx.try_recv().unwrap() else {
+        panic!("Expected instrument data event");
+    };
+    assert_eq!(published.id(), instrument.id());
 }
 
 #[rstest]
