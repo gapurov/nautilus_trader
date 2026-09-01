@@ -1589,9 +1589,11 @@ fn test_cached_spread_instrument_ids_for_preload_ignores_non_spread_orders() {
     assert!(spread_ids.is_empty());
 }
 
-#[rstest]
-fn test_parse_historical_fill_report_uses_provider_resolved_stock_venue() {
+#[tokio::test]
+async fn test_parse_historical_fill_report_uses_provider_resolved_stock_venue() {
     let (client, _, _) = create_test_execution_client();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_data_event_sender(tx);
     let equity = equity_aapl();
     let instrument_id = equity.id();
     client
@@ -1605,6 +1607,7 @@ fn test_parse_historical_fill_report_uses_provider_resolved_stock_venue() {
 
     let report = client
         .parse_historical_fill_report(&cmd, &exec_data, 1.25, "USD", UnixNanos::default())
+        .await
         .unwrap();
 
     assert_eq!(report.instrument_id, instrument_id);
@@ -1616,6 +1619,10 @@ fn test_parse_historical_fill_report_uses_provider_resolved_stock_venue() {
     assert_eq!(report.venue_order_id, VenueOrderId::from("123"));
     assert_eq!(report.last_qty, Quantity::from(10));
     assert_eq!(report.last_px, Price::from("150.25"));
+    let DataEvent::Instrument(published) = rx.try_recv().unwrap() else {
+        panic!("Expected instrument data event");
+    };
+    assert_eq!(published.id(), instrument_id);
 }
 
 #[rstest]
@@ -1648,9 +1655,11 @@ fn test_report_contract_resolution_preserves_canonical_opra_id() {
     assert_eq!(resolved, instrument_id);
 }
 
-#[rstest]
-fn test_parse_historical_fill_report_uses_cached_bag_spread_id() {
+#[tokio::test]
+async fn test_parse_historical_fill_report_uses_cached_bag_spread_id() {
     let (client, _, _) = create_test_execution_client();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    replace_data_event_sender(tx);
     let spread = create_test_option_spread();
     let instrument_id = spread.id;
     client
@@ -1671,6 +1680,7 @@ fn test_parse_historical_fill_report_uses_cached_bag_spread_id() {
 
     let report = client
         .parse_historical_fill_report(&cmd, &exec_data, 2.00, "USD", UnixNanos::default())
+        .await
         .unwrap();
 
     assert_eq!(report.instrument_id, instrument_id);
