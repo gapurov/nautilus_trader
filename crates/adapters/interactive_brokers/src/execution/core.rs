@@ -378,7 +378,7 @@ impl InteractiveBrokersExecutionClient {
         mass_status
     }
 
-    fn append_historical_fill_report(
+    async fn append_historical_fill_report(
         &self,
         cmd: &GenerateFillReports,
         exec_data: &ExecutionData,
@@ -387,13 +387,10 @@ impl InteractiveBrokersExecutionClient {
         ts_init: UnixNanos,
         reports: &mut Vec<FillReport>,
     ) -> bool {
-        match self.parse_historical_fill_report(
-            cmd,
-            exec_data,
-            commission,
-            commission_currency,
-            ts_init,
-        ) {
+        match self
+            .parse_historical_fill_report(cmd, exec_data, commission, commission_currency, ts_init)
+            .await
+        {
             Ok(Some(report)) => reports.push(report),
             Ok(None) => {}
             Err(e) => {
@@ -462,28 +459,32 @@ impl InteractiveBrokersExecutionClient {
                     if let Some((commission, commission_currency)) =
                         pending_commissions.remove(&execution_id)
                     {
-                        reports_complete &= self.append_historical_fill_report(
-                            cmd,
-                            &exec_data,
-                            commission,
-                            &commission_currency,
-                            ts_init,
-                            &mut reports,
-                        );
+                        reports_complete &= self
+                            .append_historical_fill_report(
+                                cmd,
+                                &exec_data,
+                                commission,
+                                &commission_currency,
+                                ts_init,
+                                &mut reports,
+                            )
+                            .await;
                     } else {
                         pending_exec_data.insert(execution_id, exec_data);
                     }
                 }
                 Ok(Executions::CommissionReport(commission)) => {
                     if let Some(exec_data) = pending_exec_data.remove(&commission.execution_id) {
-                        reports_complete &= self.append_historical_fill_report(
-                            cmd,
-                            &exec_data,
-                            commission.commission,
-                            &commission.currency,
-                            ts_init,
-                            &mut reports,
-                        );
+                        reports_complete &= self
+                            .append_historical_fill_report(
+                                cmd,
+                                &exec_data,
+                                commission.commission,
+                                &commission.currency,
+                                ts_init,
+                                &mut reports,
+                            )
+                            .await;
                     } else {
                         pending_commissions.insert(
                             commission.execution_id,
@@ -539,6 +540,13 @@ impl InteractiveBrokersExecutionClient {
         &self,
         contract: &Contract,
     ) -> anyhow::Result<InstrumentAny> {
+        if let Ok(instrument_id) = self.resolve_report_contract_instrument_id(contract)
+            && let Some(instrument) = self.instrument_provider.find(&instrument_id)
+        {
+            Self::publish_report_instrument(&instrument)?;
+            return Ok(instrument);
+        }
+
         let client = self.ib_client.as_ref().context("IB client not connected")?;
         let instrument = self
             .instrument_provider
@@ -2099,7 +2107,7 @@ impl InteractiveBrokersExecutionClient {
 
 #[allow(dead_code)]
 impl InteractiveBrokersExecutionClient {
-    fn parse_historical_fill_report(
+    async fn parse_historical_fill_report(
         &self,
         cmd: &GenerateFillReports,
         exec_data: &ExecutionData,
@@ -2111,17 +2119,20 @@ impl InteractiveBrokersExecutionClient {
             return Ok(None);
         }
 
-        let instrument_id = self.resolve_historical_execution_instrument_id(exec_data)?;
-
-        if let Some(filter_id) = cmd.instrument_id
-            && instrument_id != filter_id
+        if let Some(filter_venue_order_id) = cmd.venue_order_id
+            && ib_venue_order_id(exec_data.execution.order_id, exec_data.execution.perm_id)
+                != filter_venue_order_id
         {
             return Ok(None);
         }
 
-        if let Some(filter_venue_order_id) = cmd.venue_order_id
-            && ib_venue_order_id(exec_data.execution.order_id, exec_data.execution.perm_id)
-                != filter_venue_order_id
+        let instrument = self
+            .resolve_and_publish_report_instrument(&exec_data.contract)
+            .await?;
+        let instrument_id = instrument.id();
+
+        if let Some(filter_id) = cmd.instrument_id
+            && instrument_id != filter_id
         {
             return Ok(None);
         }
@@ -2138,13 +2149,6 @@ impl InteractiveBrokersExecutionClient {
             None, // avg_px (not available in historical fills)
         )
         .map(Some)
-    }
-
-    fn resolve_historical_execution_instrument_id(
-        &self,
-        exec_data: &ExecutionData,
-    ) -> anyhow::Result<InstrumentId> {
-        self.resolve_report_contract_instrument_id(&exec_data.contract)
     }
 
     fn resolve_report_contract_instrument_id(
