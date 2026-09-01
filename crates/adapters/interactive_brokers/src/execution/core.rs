@@ -53,9 +53,12 @@ use nautilus_common::{
     clients::ExecutionClient,
     enums::LogLevel,
     factories::OrderEventFactory,
-    live::{get_runtime, runner::get_exec_event_sender},
+    live::{
+        get_runtime,
+        runner::{get_exec_event_sender, try_get_data_event_sender},
+    },
     messages::{
-        ExecutionEvent,
+        DataEvent, ExecutionEvent,
         execution::{
             BatchCancelOrders, CancelAllOrders, CancelOrder, ExecutionReport, GenerateFillReports,
             GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -523,6 +526,33 @@ impl InteractiveBrokersExecutionClient {
         }
 
         Ok((reports, reports_complete))
+    }
+
+    fn publish_report_instrument(instrument: &InstrumentAny) -> anyhow::Result<()> {
+        try_get_data_event_sender()
+            .context("Data event sender not initialized")?
+            .send(DataEvent::Instrument(instrument.clone()))
+            .map_err(|e| anyhow::anyhow!("Failed to publish IBKR report instrument: {e}"))
+    }
+
+    async fn resolve_and_publish_report_instrument(
+        &self,
+        contract: &Contract,
+    ) -> anyhow::Result<InstrumentAny> {
+        let client = self.ib_client.as_ref().context("IB client not connected")?;
+        let instrument = self
+            .instrument_provider
+            .get_instrument(client.as_arc().as_ref(), contract)
+            .await?
+            .with_context(|| {
+                format!(
+                    "IBKR contract {} did not resolve to an instrument",
+                    contract.contract_id
+                )
+            })?;
+
+        Self::publish_report_instrument(&instrument)?;
+        Ok(instrument)
     }
 
     fn submit_order_list_with_orders(
@@ -1156,17 +1186,10 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                         }
 
                         let instrument = match self
-                            .instrument_provider
-                            .get_instrument(client.as_arc().as_ref(), &position.contract)
+                            .resolve_and_publish_report_instrument(&position.contract)
                             .await
                         {
-                            Ok(Some(instrument)) => instrument,
-                            Ok(None) => {
-                                anyhow::bail!(
-                                    "Cannot generate synthetic order report: instrument not found for contract {}",
-                                    position.contract.contract_id,
-                                );
-                            }
+                            Ok(instrument) => instrument,
                             Err(e) => {
                                 return Err(e).with_context(|| {
                                     format!(
@@ -1284,17 +1307,10 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                     }
 
                     let instrument = match self
-                        .instrument_provider
-                        .get_instrument(client.as_arc().as_ref(), &position.contract)
+                        .resolve_and_publish_report_instrument(&position.contract)
                         .await
                     {
-                        Ok(Some(instrument)) => instrument,
-                        Ok(None) => {
-                            anyhow::bail!(
-                                "Cannot generate position status report: instrument not found for contract {}",
-                                position.contract.contract_id,
-                            );
-                        }
+                        Ok(instrument) => instrument,
                         Err(e) => {
                             return Err(e).with_context(|| {
                                 format!(

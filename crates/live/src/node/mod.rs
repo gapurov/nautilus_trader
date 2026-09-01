@@ -427,7 +427,7 @@ impl LiveNode {
             }
         }
 
-        if let Err(e) = self.perform_startup_reconciliation().await {
+        if let Err(e) = self.perform_startup_reconciliation(None).await {
             if let Err(finalize_err) = self.abort_startup("Startup reconciliation failed").await {
                 anyhow::bail!(
                     "startup reconciliation failed: {e}; failed to finalize startup abort: {finalize_err}"
@@ -735,7 +735,10 @@ impl LiveNode {
     ///
     /// Returns an error if reconciliation fails or times out.
     #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
-    async fn perform_startup_reconciliation(&mut self) -> anyhow::Result<()> {
+    async fn perform_startup_reconciliation(
+        &mut self,
+        mut flush_data: Option<&mut dyn FnMut()>,
+    ) -> anyhow::Result<()> {
         if !self.config.exec_engine.reconciliation {
             log::info!("Startup reconciliation disabled");
             self.kernel
@@ -791,6 +794,15 @@ impl LiveNode {
 
             match mass_status_result {
                 Ok(Some(mass_status)) => {
+                    if let Some(flush_data) = flush_data.as_deref_mut() {
+                        flush_data();
+                    } else {
+                        self.runner
+                            .as_mut()
+                            .context("Runner unavailable during startup reconciliation")?
+                            .flush_pending_data();
+                    }
+
                     log_info!(
                         "Reconciling ExecutionMassStatus for {}",
                         client_id,
@@ -1139,7 +1151,15 @@ impl LiveNode {
         debug_assert_eq!(engine_connection_status, EngineConnectionStatus::Connected);
 
         // Run reconciliation now that instruments are in cache and start trader
-        if let Err(e) = self.perform_startup_reconciliation().await {
+        let reconciliation_result = {
+            let mut flush_data = || {
+                flush_pending_data(&mut pending, &mut data_evt_rx, &mut data_cmd_rx);
+            };
+            self.perform_startup_reconciliation(Some(&mut flush_data))
+                .await
+        };
+
+        if let Err(e) = reconciliation_result {
             let result = self.abort_startup("Startup reconciliation failed").await;
             Self::drain_channels(
                 &mut time_evt_rx,
@@ -1439,6 +1459,7 @@ impl LiveNode {
                     let maintenance_start = dst::time::Instant::now();
 
                     drop(open_order_report_task.take());
+                    process_queued_data_events(&mut data_evt_rx);
 
                     match result {
                         ReportTaskOutcome::Completed(result) => {
@@ -1518,6 +1539,7 @@ impl LiveNode {
                     let maintenance_start = dst::time::Instant::now();
 
                     drop(position_report_task.take());
+                    process_queued_data_events(&mut data_evt_rx);
 
                     match result {
                         ReportTaskOutcome::Completed(result) => {
@@ -3196,6 +3218,20 @@ fn flush_pending_data(
         if !progressed {
             break;
         }
+    }
+}
+
+/// Processes the data events that were queued when a report task completed.
+fn process_queued_data_events(
+    data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+) {
+    let queued = data_evt_rx.len();
+
+    for _ in 0..queued {
+        let Ok(event) = data_evt_rx.try_recv() else {
+            break;
+        };
+        AsyncRunner::handle_data_event(event);
     }
 }
 
