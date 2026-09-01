@@ -795,7 +795,7 @@ mod tests {
         assert_eq!(result.attempts, 1);
         assert_eq!(requests.load(Ordering::Relaxed), 1);
         server.await.unwrap();
-        let released = match gate.try_admit_http().await.unwrap() {
+        let released = match gate.admit_http().await.unwrap() {
             AdmissionDecision::Admitted(lease) => lease,
             decision => panic!("expected released concurrency, was {decision:?}"),
         };
@@ -839,7 +839,7 @@ mod tests {
         let result = client.request(request, UUID4::new().to_string()).await;
         assert_eq!(result.outcome, UnusualWhalesOutcome::TransportUnavailable);
         assert_eq!(result.attempts, 1);
-        let released = match gate.try_admit_http().await.unwrap() {
+        let released = match gate.admit_http().await.unwrap() {
             AdmissionDecision::Admitted(lease) => lease,
             decision => panic!("expected released concurrency, was {decision:?}"),
         };

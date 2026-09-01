@@ -790,7 +790,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires UNUSUAL_WHALES_DRAGONFLY_TEST_URL"]
     async fn denied_claim_changes_no_usage_state() {
-        let (gate, _) = integration_gate(2, 1, 2, Duration::from_secs(1)).await;
+        let (gate, _) = integration_gate(2, 1, 3, Duration::from_secs(1)).await;
         let first = admitted(&gate).await;
         assert!(matches!(
             gate.try_admit_http().await.unwrap(),
