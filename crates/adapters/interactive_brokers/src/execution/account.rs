@@ -105,7 +105,7 @@ pub async fn subscribe_account_summary(
                 );
 
                 match parse_account_summary_to_balance(&summary) {
-                    Ok(balance) => {
+                    Ok(Some(balance)) => {
                         // Check if balance already exists for this currency
                         if let Some(existing) = balances
                             .iter_mut()
@@ -123,6 +123,7 @@ pub async fn subscribe_account_summary(
                             balances.push(balance);
                         }
                     }
+                    Ok(None) => {}
                     Err(e) => {
                         tracing::warn!("Failed to parse account summary: {}", e);
                     }
@@ -157,6 +158,13 @@ pub async fn subscribe_account_summary(
 }
 
 fn merge_account_summary_margin(margins: &mut Vec<MarginBalance>, summary: &AccountSummary) {
+    if !matches!(
+        summary.tag.as_str(),
+        AccountSummaryTags::INIT_MARGIN_REQ | AccountSummaryTags::MAINT_MARGIN_REQ
+    ) {
+        return;
+    }
+
     let currency = match parse_currency(&summary.currency) {
         Ok(currency) => currency,
         Err(e) => {
@@ -512,8 +520,23 @@ pub async fn subscribe_positions(
     Ok(())
 }
 
-/// Parse IB account summary to Nautilus AccountBalance.
-fn parse_account_summary_to_balance(summary: &AccountSummary) -> anyhow::Result<AccountBalance> {
+/// Parses a supported IB account summary tag into a Nautilus `AccountBalance`.
+fn parse_account_summary_to_balance(
+    summary: &AccountSummary,
+) -> anyhow::Result<Option<AccountBalance>> {
+    if !matches!(
+        summary.tag.as_str(),
+        AccountSummaryTags::SETTLED_CASH
+            | AccountSummaryTags::TOTAL_CASH_VALUE
+            | AccountSummaryTags::NET_LIQUIDATION
+            | AccountSummaryTags::BUYING_POWER
+            | AccountSummaryTags::EQUITY_WITH_LOAN_VALUE
+            | AccountSummaryTags::AVAILABLE_FUNDS
+            | AccountSummaryTags::EXCESS_LIQUIDITY
+    ) {
+        return Ok(None);
+    }
+
     let currency = parse_currency(&summary.currency)?;
     let balance = parse_balance_decimal(&summary.value)?;
 
@@ -521,23 +544,28 @@ fn parse_account_summary_to_balance(summary: &AccountSummary) -> anyhow::Result<
         AccountSummaryTags::SETTLED_CASH | AccountSummaryTags::TOTAL_CASH_VALUE => {
             // Cash balance - free equals total for settled cash
             AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)
+                .map(Some)
                 .map_err(Into::into)
         }
         AccountSummaryTags::NET_LIQUIDATION => {
             // Net liquidation - represents total equity
             // Free would be calculated from available funds
             AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)
+                .map(Some)
                 .map_err(Into::into)
         }
         AccountSummaryTags::BUYING_POWER | AccountSummaryTags::AVAILABLE_FUNDS => {
             // Available funds - this is the free amount
-            AccountBalance::from_total_and_free(balance, balance, currency).map_err(Into::into)
-        }
-        _ => {
-            // Default: treat as total balance
-            AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)
+            AccountBalance::from_total_and_free(balance, balance, currency)
+                .map(Some)
                 .map_err(Into::into)
         }
+        AccountSummaryTags::EQUITY_WITH_LOAN_VALUE | AccountSummaryTags::EXCESS_LIQUIDITY => {
+            AccountBalance::from_total_and_locked(balance, Decimal::ZERO, currency)
+                .map(Some)
+                .map_err(Into::into)
+        }
+        _ => Ok(None),
     }
 }
 
@@ -561,7 +589,8 @@ mod tests {
 
     use super::{
         AccountSummaryTags, check_external_position_change, create_position_tracker,
-        merge_account_summary_balance, merge_account_summary_margin, parse_currency,
+        merge_account_summary_balance, merge_account_summary_margin,
+        parse_account_summary_to_balance, parse_currency,
     };
 
     fn margin_summary(tag: &str, value: &str, currency: &str) -> AccountSummary {
@@ -593,6 +622,30 @@ mod tests {
     #[rstest]
     fn test_parse_currency_rejects_empty_string() {
         let result = parse_currency("");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Account summary currency was empty",
+        );
+    }
+
+    #[rstest]
+    fn test_cushion_with_empty_currency_is_ignored_by_typed_balances() {
+        let summary = margin_summary(AccountSummaryTags::CUSHION, "0.42", "");
+        let balance = parse_account_summary_to_balance(&summary).unwrap();
+        let mut margins: Vec<MarginBalance> = Vec::new();
+
+        merge_account_summary_margin(&mut margins, &summary);
+
+        assert!(balance.is_none());
+        assert!(margins.is_empty());
+    }
+
+    #[rstest]
+    fn test_monetary_balance_with_empty_currency_is_rejected() {
+        let summary = margin_summary(AccountSummaryTags::NET_LIQUIDATION, "100.00", "");
+        let result = parse_account_summary_to_balance(&summary);
+
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
