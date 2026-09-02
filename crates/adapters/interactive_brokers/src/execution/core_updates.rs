@@ -8,6 +8,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use ibapi::subscriptions::SubscriptionItem;
+use nautilus_common::{live::runner::get_data_event_sender, messages::DataEvent};
 
 use super::*;
 use crate::{
@@ -22,7 +23,12 @@ impl InteractiveBrokersExecutionClient {
     ///
     /// Returns an error if starting the subscription fails.
     pub(super) async fn start_order_updates(&mut self) -> anyhow::Result<()> {
-        let client = self.ib_client.as_ref().context("IB client not connected")?;
+        let client = Arc::clone(
+            self.ib_client
+                .as_ref()
+                .context("IB client not connected")?
+                .as_arc(),
+        );
 
         let timeout_dur = Duration::from_secs(self.config.request_timeout);
         log::debug!(
@@ -38,6 +44,7 @@ impl InteractiveBrokersExecutionClient {
         let order_id_map = Arc::clone(&self.order_id_map);
         let venue_order_id_map = Arc::clone(&self.venue_order_id_map);
         let instrument_provider = Arc::clone(&self.instrument_provider);
+        let data_sender = get_data_event_sender();
         let exec_sender = get_exec_event_sender();
         let clock = get_atomic_clock_realtime();
         let account_id = self.core.account_id;
@@ -58,9 +65,11 @@ impl InteractiveBrokersExecutionClient {
         let handle = get_runtime().spawn(async move {
             Self::process_order_update_stream(
                 &mut subscription,
+                &client,
                 &order_id_map,
                 &venue_order_id_map,
                 &instrument_provider,
+                &data_sender,
                 &exec_sender,
                 clock,
                 account_id,
@@ -91,9 +100,11 @@ impl InteractiveBrokersExecutionClient {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn process_order_update_stream(
         subscription: &mut ibapi::subscriptions::Subscription<OrderUpdate>,
+        client: &ibapi::Client,
         order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
         venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
         instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
+        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         clock: &'static AtomicTime,
         account_id: AccountId,
@@ -116,9 +127,11 @@ impl InteractiveBrokersExecutionClient {
                 Ok(SubscriptionItem::Data(update)) => {
                     if let Err(e) = Self::handle_order_update(
                         &update,
+                        client,
                         order_id_map,
                         venue_order_id_map,
                         instrument_provider,
+                        data_sender,
                         exec_sender,
                         clock,
                         account_id,
@@ -154,9 +167,11 @@ impl InteractiveBrokersExecutionClient {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_order_update(
         update: &OrderUpdate,
+        client: &ibapi::Client,
         order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
         venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
         instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
+        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         clock: &'static AtomicTime,
         account_id: AccountId,
@@ -221,9 +236,11 @@ impl InteractiveBrokersExecutionClient {
 
                 Self::handle_execution_data(
                     exec_data,
+                    client,
                     order_id_map,
                     venue_order_id_map,
                     instrument_provider,
+                    data_sender,
                     exec_sender,
                     ts_init,
                     account_id,
@@ -265,9 +282,11 @@ impl InteractiveBrokersExecutionClient {
                 if let Some(exec_data) = pending_exec_data {
                     Self::handle_execution_data(
                         &exec_data,
+                        client,
                         order_id_map,
                         venue_order_id_map,
                         instrument_provider,
+                        data_sender,
                         exec_sender,
                         ts_init,
                         account_id,
@@ -757,9 +776,11 @@ impl InteractiveBrokersExecutionClient {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_execution_data(
         exec_data: &ExecutionData,
+        client: &ibapi::Client,
         order_id_map: &Arc<Mutex<AHashMap<ClientOrderId, i32>>>,
         venue_order_id_map: &Arc<Mutex<AHashMap<i32, ClientOrderId>>>,
         instrument_provider: &Arc<InteractiveBrokersInstrumentProvider>,
+        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
         exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
         ts_init: UnixNanos,
         account_id: AccountId,
@@ -810,17 +831,59 @@ impl InteractiveBrokersExecutionClient {
             return Ok(());
         };
 
-        let instrument_id = if let Some(mapped_id) =
+        let mapped_instrument_id =
             Self::get_mapped_instrument_id(exec_data.execution.order_id, instrument_id_map)?
-        {
-            mapped_id
-        } else if let Some(cached_id) =
-            instrument_provider.get_instrument_id_by_contract_id(exec_data.contract.contract_id)
-        {
-            cached_id
+                .or_else(|| {
+                    tracked_context
+                        .as_ref()
+                        .map(|context| context.instrument_id)
+                });
+        let cached_instrument = mapped_instrument_id
+            .and_then(|instrument_id| instrument_provider.find(&instrument_id))
+            .or_else(|| {
+                instrument_provider
+                    .get_instrument_id_by_contract_id(exec_data.contract.contract_id)
+                    .and_then(|instrument_id| instrument_provider.find(&instrument_id))
+            });
+
+        let (instrument, newly_resolved) = if let Some(instrument) = cached_instrument {
+            (instrument, false)
         } else {
-            Self::resolve_contract_instrument_id(instrument_provider, &exec_data.contract)?
+            let instrument = instrument_provider
+                .get_instrument(client, &exec_data.contract)
+                .await?
+                .with_context(|| {
+                    format!(
+                        "Instrument not found for IBKR contract ID {}",
+                        exec_data.contract.contract_id
+                    )
+                })?;
+
+            (instrument, true)
         };
+
+        if let Some(mapped_instrument_id) = mapped_instrument_id {
+            anyhow::ensure!(
+                instrument.id() == mapped_instrument_id,
+                "IBKR instrument ID mismatch for order {}: broker={}, mapped={}",
+                exec_data.execution.order_id,
+                instrument.id(),
+                mapped_instrument_id,
+            );
+        }
+
+        if newly_resolved {
+            data_sender
+                .send(DataEvent::Instrument(instrument.clone()))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to publish broker-resolved IBKR instrument {}: {e}",
+                        instrument.id()
+                    )
+                })?;
+        }
+
+        let instrument_id = instrument.id();
 
         let (commission, commission_currency) = {
             let mut cache = commission_cache

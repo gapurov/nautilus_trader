@@ -10,6 +10,7 @@
 use std::{cell::RefCell, rc::Rc, str::FromStr};
 
 use ibapi::{
+    Client, IncomingMessages,
     contracts::{
         Contract, ContractDetails, Currency as IBCurrency, Exchange, LegAction, OptionRight,
         SecurityType, Symbol as IBSymbol,
@@ -40,6 +41,7 @@ use nautilus_model::{
 };
 use rstest::rstest;
 use rust_decimal::Decimal;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ustr::Ustr;
 
 use super::*;
@@ -51,6 +53,138 @@ use crate::{
 fn create_test_instrument_provider() -> Arc<InteractiveBrokersInstrumentProvider> {
     let config = crate::config::InteractiveBrokersInstrumentProviderConfig::default();
     Arc::new(InteractiveBrokersInstrumentProvider::new(config))
+}
+
+// Mirrors the pinned ibapi 3.3.0 test protocol for a stock contract-details response
+const TEST_IB_SERVER_VERSION: i32 = 213;
+const TEST_IB_PROTOBUF_MESSAGE_OFFSET: i32 = 200;
+const TEST_IB_REQUEST_ID: i32 = 9000;
+
+fn push_test_ib_varint(buffer: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        buffer.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    buffer.push(value as u8);
+}
+
+fn push_test_ib_varint_field(buffer: &mut Vec<u8>, field: u32, value: u64) {
+    push_test_ib_varint(buffer, u64::from(field << 3));
+    push_test_ib_varint(buffer, value);
+}
+
+fn push_test_ib_bytes_field(buffer: &mut Vec<u8>, field: u32, value: &[u8]) {
+    push_test_ib_varint(buffer, u64::from((field << 3) | 2));
+    push_test_ib_varint(buffer, value.len() as u64);
+    buffer.extend_from_slice(value);
+}
+
+fn test_ib_protobuf_frame(message: IncomingMessages, body: &[u8]) -> Vec<u8> {
+    let mut frame = (message as i32 + TEST_IB_PROTOBUF_MESSAGE_OFFSET)
+        .to_be_bytes()
+        .to_vec();
+    frame.extend_from_slice(body);
+    frame
+}
+
+fn test_ib_contract_data(contract_id: i32) -> Vec<u8> {
+    let mut contract = Vec::new();
+    push_test_ib_varint_field(&mut contract, 1, contract_id as u64);
+    push_test_ib_bytes_field(&mut contract, 2, b"AAPL");
+    push_test_ib_bytes_field(&mut contract, 3, b"STK");
+    push_test_ib_bytes_field(&mut contract, 8, b"SMART");
+    push_test_ib_bytes_field(&mut contract, 9, b"NASDAQ");
+    push_test_ib_bytes_field(&mut contract, 10, b"USD");
+    push_test_ib_bytes_field(&mut contract, 11, b"AAPL");
+    push_test_ib_bytes_field(&mut contract, 12, b"NMS");
+
+    let mut details = Vec::new();
+    push_test_ib_bytes_field(&mut details, 1, b"NMS");
+    push_test_ib_bytes_field(&mut details, 2, b"0.01");
+    push_test_ib_bytes_field(&mut details, 4, b"SMART,NASDAQ");
+    push_test_ib_bytes_field(&mut details, 23, b"COMMON");
+    push_test_ib_bytes_field(&mut details, 24, b"1");
+    push_test_ib_bytes_field(&mut details, 25, b"1");
+    push_test_ib_bytes_field(&mut details, 26, b"100");
+
+    let mut body = Vec::new();
+    push_test_ib_varint_field(&mut body, 1, TEST_IB_REQUEST_ID as u64);
+    push_test_ib_bytes_field(&mut body, 2, &contract);
+    push_test_ib_bytes_field(&mut body, 3, &details);
+    test_ib_protobuf_frame(IncomingMessages::ContractData, &body)
+}
+
+async fn write_test_ib_frame(
+    stream: &mut tokio::net::TcpStream,
+    frame: &[u8],
+) -> std::io::Result<()> {
+    stream
+        .write_all(&(frame.len() as u32).to_be_bytes())
+        .await?;
+    stream.write_all(frame).await
+}
+
+async fn read_test_ib_frame(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut length = [0; 4];
+    stream.read_exact(&mut length).await?;
+    let mut frame = vec![0; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut frame).await?;
+    Ok(frame)
+}
+
+async fn create_test_ib_client(contract_id: i32) -> Client {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let _server = /* tokio-import-ok */ tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut magic = [0; 4];
+        stream.read_exact(&mut magic).await.unwrap();
+        assert_eq!(&magic, b"API\0");
+        read_test_ib_frame(&mut stream).await.unwrap();
+
+        let handshake = format!("{TEST_IB_SERVER_VERSION}\020240120 12:00:00 EST\0");
+        write_test_ib_frame(&mut stream, handshake.as_bytes())
+            .await
+            .unwrap();
+        read_test_ib_frame(&mut stream).await.unwrap();
+
+        let mut next_valid_id = Vec::new();
+        push_test_ib_varint_field(&mut next_valid_id, 1, 9000);
+        write_test_ib_frame(
+            &mut stream,
+            &test_ib_protobuf_frame(IncomingMessages::NextValidId, &next_valid_id),
+        )
+        .await
+        .unwrap();
+
+        let mut managed_accounts = Vec::new();
+        push_test_ib_bytes_field(&mut managed_accounts, 1, b"DU123456");
+        write_test_ib_frame(
+            &mut stream,
+            &test_ib_protobuf_frame(IncomingMessages::ManagedAccounts, &managed_accounts),
+        )
+        .await
+        .unwrap();
+
+        if read_test_ib_frame(&mut stream).await.is_ok() {
+            write_test_ib_frame(&mut stream, &test_ib_contract_data(contract_id))
+                .await
+                .unwrap();
+            let mut contract_data_end = Vec::new();
+            push_test_ib_varint_field(&mut contract_data_end, 1, TEST_IB_REQUEST_ID as u64);
+            write_test_ib_frame(
+                &mut stream,
+                &test_ib_protobuf_frame(IncomingMessages::ContractDataEnd, &contract_data_end),
+            )
+            .await
+            .unwrap();
+
+            while read_test_ib_frame(&mut stream).await.is_ok() {}
+        }
+    });
+
+    Client::connect(&address.to_string(), 100).await.unwrap()
 }
 
 fn create_test_execution_client() -> (
@@ -1467,6 +1601,8 @@ async fn handle_order_update_ignores_deactivated_open_order(
     let order_id_map = Arc::new(Mutex::new(AHashMap::new()));
     let venue_order_id_map = Arc::new(Mutex::new(AHashMap::new()));
     let instrument_provider = create_test_instrument_provider();
+    let client = create_test_ib_client(12345).await;
+    let (data_sender, _data_receiver) = tokio::sync::mpsc::unbounded_channel();
     let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
     let commission_cache = Arc::new(Mutex::new(CommissionCache::new()));
     let instrument_id_map = Arc::new(Mutex::new(AHashMap::new()));
@@ -1514,9 +1650,11 @@ async fn handle_order_update_ignores_deactivated_open_order(
 
     let result = InteractiveBrokersExecutionClient::handle_order_update(
         &OrderUpdate::OpenOrder(open_order),
+        &client,
         &order_id_map,
         &venue_order_id_map,
         &instrument_provider,
+        &data_sender,
         &exec_sender,
         nautilus_core::time::get_atomic_clock_realtime(),
         AccountId::from("IB-001"),
@@ -2823,6 +2961,8 @@ async fn test_opra_cancel_status_preserves_canonical_instrument_identity() {
 #[tokio::test]
 async fn test_process_order_update_stream_emits_accepted_then_canceled() {
     let instrument_provider = create_test_instrument_provider();
+    let client = create_test_ib_client(12345).await;
+    let (data_sender, _data_receiver) = tokio::sync::mpsc::unbounded_channel();
     let venue_order_id_map = Arc::new(Mutex::new(AHashMap::new()));
     let instrument_id_map = Arc::new(Mutex::new(AHashMap::new()));
     let trader_id_map = Arc::new(Mutex::new(AHashMap::new()));
@@ -2883,9 +3023,11 @@ async fn test_process_order_update_stream_emits_accepted_then_canceled() {
 
     InteractiveBrokersExecutionClient::process_order_update_stream(
         &mut subscription,
+        &client,
         &order_id_map,
         &venue_order_id_map,
         &instrument_provider,
+        &data_sender,
         &exec_sender,
         nautilus_core::time::get_atomic_clock_realtime(),
         AccountId::from("IB-001"),
@@ -2924,6 +3066,8 @@ async fn test_process_order_update_stream_clears_market_order_update_prices() {
     let equity = equity_aapl();
     let order_id = 7005;
     let contract_id = 12347;
+    let client = create_test_ib_client(contract_id).await;
+    let (data_sender, _data_receiver) = tokio::sync::mpsc::unbounded_channel();
     let client_order_id = ClientOrderId::from("O-STREAM-MKT-UPDATE");
     let venue_order_id_map = Arc::new(Mutex::new(AHashMap::new()));
     let instrument_id_map = Arc::new(Mutex::new(AHashMap::new()));
@@ -2981,9 +3125,11 @@ async fn test_process_order_update_stream_clears_market_order_update_prices() {
 
     InteractiveBrokersExecutionClient::process_order_update_stream(
         &mut subscription,
+        &client,
         &order_id_map,
         &venue_order_id_map,
         &instrument_provider,
+        &data_sender,
         &exec_sender,
         nautilus_core::time::get_atomic_clock_realtime(),
         AccountId::from("IB-001"),
@@ -3032,6 +3178,8 @@ async fn test_process_order_update_stream_emits_fill_after_commission_report(
     let equity = equity_aapl();
     let order_id = 7003;
     let contract_id = 12345;
+    let client = create_test_ib_client(contract_id).await;
+    let (data_sender, _data_receiver) = tokio::sync::mpsc::unbounded_channel();
     let client_order_id = ClientOrderId::from("O-STREAM-002");
     let venue_order_id_map = Arc::new(Mutex::new(AHashMap::new()));
     let instrument_id_map = Arc::new(Mutex::new(AHashMap::new()));
@@ -3102,9 +3250,11 @@ async fn test_process_order_update_stream_emits_fill_after_commission_report(
 
     InteractiveBrokersExecutionClient::process_order_update_stream(
         &mut subscription,
+        &client,
         &order_id_map,
         &venue_order_id_map,
         &instrument_provider,
+        &data_sender,
         &exec_sender,
         nautilus_core::time::get_atomic_clock_realtime(),
         AccountId::from("IB-001"),
@@ -3155,11 +3305,175 @@ async fn test_process_order_update_stream_emits_fill_after_commission_report(
 }
 
 #[tokio::test]
+async fn test_handle_execution_data_resolves_and_publishes_uncached_instrument() {
+    let instrument_provider = create_test_instrument_provider();
+    let tracking = SubmitTrackingState::new();
+    let order_id = 7_010;
+    let contract_id = 23_456;
+    let client_order_id = ClientOrderId::from("O-STREAM-UNCACHED");
+    let mapped_instrument_id = InstrumentId::from("AAPL.NASDAQ");
+    let execution_id = String::from("exec-stream-uncached");
+    let client = create_test_ib_client(contract_id).await;
+    let commission_cache = Arc::new(Mutex::new(CommissionCache::new()));
+    let spread_fill_tracking = Arc::new(Mutex::new(AHashMap::new()));
+    let order_avg_prices = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_combo_fills = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_combo_fill_avgs = Arc::new(Mutex::new(AHashMap::new()));
+    let order_fill_progress = Arc::new(Mutex::new(AHashMap::new()));
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (data_sender, mut data_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    tracking
+        .instrument_id_map
+        .lock()
+        .unwrap()
+        .insert(order_id, mapped_instrument_id);
+    commission_cache
+        .lock()
+        .unwrap()
+        .insert(execution_id.clone(), (1.25, String::from("USD")));
+
+    let mut exec_data = create_test_execution_data(order_id, &execution_id, 100.0, 50.0, "BOT");
+    exec_data.contract.contract_id = contract_id;
+    exec_data.contract.security_type = SecurityType::Stock;
+    exec_data.contract.symbol = IBSymbol::from("AAPL");
+    exec_data.contract.exchange = Exchange::from("SMART");
+    exec_data.contract.currency = IBCurrency::from("USD");
+    exec_data.execution.order_reference = client_order_id.to_string();
+
+    let result = InteractiveBrokersExecutionClient::handle_execution_data(
+        &exec_data,
+        &client,
+        &tracking.order_id_map,
+        &tracking.venue_order_id_map,
+        &instrument_provider,
+        &data_sender,
+        &exec_sender,
+        UnixNanos::new(1),
+        AccountId::from("IB-001"),
+        &commission_cache,
+        &spread_fill_tracking,
+        &tracking.instrument_id_map,
+        &tracking.active_order_contexts,
+        &tracking.terminal_order_contexts,
+        &order_avg_prices,
+        &pending_combo_fills,
+        &pending_combo_fill_avgs,
+        &order_fill_progress,
+    )
+    .await;
+    result.unwrap();
+
+    let resolved_instrument_id = match data_receiver.try_recv().unwrap() {
+        DataEvent::Instrument(instrument) => instrument.id(),
+        other => panic!("unexpected data event: {other:?}"),
+    };
+    assert_eq!(resolved_instrument_id, mapped_instrument_id);
+    assert!(instrument_provider.find(&resolved_instrument_id).is_some());
+    assert_eq!(
+        instrument_provider.get_instrument_id_by_contract_id(contract_id),
+        Some(resolved_instrument_id)
+    );
+
+    match exec_receiver.try_recv().unwrap() {
+        ExecutionEvent::Report(ExecutionReport::Fill(fill)) => {
+            assert_eq!(fill.client_order_id, Some(client_order_id));
+            assert_eq!(fill.instrument_id, resolved_instrument_id);
+            assert_eq!(fill.trade_id, TradeId::from("exec-stream-uncached"));
+        }
+        other => panic!("unexpected execution event: {other:?}"),
+    }
+    assert!(data_receiver.try_recv().is_err());
+    assert!(exec_receiver.try_recv().is_err());
+    assert!(commission_cache.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_handle_execution_data_rejects_canonical_instrument_id_mismatch() {
+    let instrument_provider = create_test_instrument_provider();
+    let tracking = SubmitTrackingState::new();
+    let broker_instrument_id = InstrumentId::from("AAPL.NASDAQ");
+    let mapped_instrument_id = InstrumentId::from("AAPL.SMART");
+    let order_id = 7_011;
+    let contract_id = 23_457;
+    let client_order_id = ClientOrderId::from("O-STREAM-ID-MISMATCH");
+    let execution_id = String::from("exec-stream-id-mismatch");
+    let client = create_test_ib_client(contract_id).await;
+    let commission_cache = Arc::new(Mutex::new(CommissionCache::new()));
+    let spread_fill_tracking = Arc::new(Mutex::new(AHashMap::new()));
+    let order_avg_prices = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_combo_fills = Arc::new(Mutex::new(AHashMap::new()));
+    let pending_combo_fill_avgs = Arc::new(Mutex::new(AHashMap::new()));
+    let order_fill_progress = Arc::new(Mutex::new(AHashMap::new()));
+    let (exec_sender, mut exec_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (data_sender, mut data_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    assert_ne!(broker_instrument_id, mapped_instrument_id);
+    let mut context = create_tracked_order_context(client_order_id, mapped_instrument_id);
+    context.accepted = true;
+    tracking
+        .terminal_order_contexts
+        .lock()
+        .unwrap()
+        .insert(order_id, context);
+    commission_cache
+        .lock()
+        .unwrap()
+        .insert(execution_id.clone(), (1.25, String::from("USD")));
+
+    let mut exec_data = create_test_execution_data(order_id, &execution_id, 100.0, 50.0, "BOT");
+    exec_data.contract.contract_id = contract_id;
+    exec_data.contract.security_type = SecurityType::Stock;
+    exec_data.contract.symbol = IBSymbol::from("AAPL");
+    exec_data.contract.exchange = Exchange::from("SMART");
+    exec_data.contract.currency = IBCurrency::from("USD");
+    exec_data.execution.order_reference = client_order_id.to_string();
+
+    let result = InteractiveBrokersExecutionClient::handle_execution_data(
+        &exec_data,
+        &client,
+        &tracking.order_id_map,
+        &tracking.venue_order_id_map,
+        &instrument_provider,
+        &data_sender,
+        &exec_sender,
+        UnixNanos::new(1),
+        AccountId::from("IB-001"),
+        &commission_cache,
+        &spread_fill_tracking,
+        &tracking.instrument_id_map,
+        &tracking.active_order_contexts,
+        &tracking.terminal_order_contexts,
+        &order_avg_prices,
+        &pending_combo_fills,
+        &pending_combo_fill_avgs,
+        &order_fill_progress,
+    )
+    .await;
+
+    let error = result.unwrap_err().to_string();
+    let expected = format!(
+        concat!(
+            "IBKR instrument ID mismatch for order {}: ",
+            "broker={}, mapped={}"
+        ),
+        order_id, broker_instrument_id, mapped_instrument_id
+    );
+    assert_eq!(error, expected);
+    assert!(instrument_provider.find(&broker_instrument_id).is_some());
+    assert!(data_receiver.try_recv().is_err());
+    assert!(exec_receiver.try_recv().is_err());
+    assert!(commission_cache.lock().unwrap().contains_key(&execution_id));
+}
+
+#[tokio::test]
 async fn test_process_order_update_stream_retains_terminal_identity_for_late_fill() {
     let instrument_provider = create_test_instrument_provider();
     let equity = equity_aapl();
     let order_id = 7006;
     let contract_id = 12348;
+    let client = create_test_ib_client(contract_id).await;
+    let (data_sender, _data_receiver) = tokio::sync::mpsc::unbounded_channel();
     let client_order_id = ClientOrderId::from("O-STREAM-LATE-FILL");
     let instrument_id = equity.id();
     let order_id_map = Arc::new(Mutex::new(AHashMap::new()));
@@ -3228,9 +3542,11 @@ async fn test_process_order_update_stream_retains_terminal_identity_for_late_fil
 
     InteractiveBrokersExecutionClient::process_order_update_stream(
         &mut subscription,
+        &client,
         &order_id_map,
         &venue_order_id_map,
         &instrument_provider,
+        &data_sender,
         &exec_sender,
         nautilus_core::time::get_atomic_clock_realtime(),
         AccountId::from("IB-001"),
@@ -3279,9 +3595,11 @@ async fn test_process_order_update_stream_retains_terminal_identity_for_late_fil
 
     InteractiveBrokersExecutionClient::process_order_update_stream(
         &mut subscription,
+        &client,
         &order_id_map,
         &venue_order_id_map,
         &instrument_provider,
+        &data_sender,
         &exec_sender,
         nautilus_core::time::get_atomic_clock_realtime(),
         AccountId::from("IB-001"),
@@ -3323,6 +3641,8 @@ async fn test_process_order_update_stream_retains_terminal_combo_routing() {
     let spread = create_test_option_spread();
     let order_id = 7007;
     let contract_id = 12345;
+    let client = create_test_ib_client(contract_id).await;
+    let (data_sender, _data_receiver) = tokio::sync::mpsc::unbounded_channel();
     let client_order_id = ClientOrderId::from("O-STREAM-LATE-COMBO");
     let instrument_id = spread.id;
     let leg_instrument_id = equity.id();
@@ -3402,9 +3722,11 @@ async fn test_process_order_update_stream_retains_terminal_combo_routing() {
 
     InteractiveBrokersExecutionClient::process_order_update_stream(
         &mut subscription,
+        &client,
         &order_id_map,
         &venue_order_id_map,
         &instrument_provider,
+        &data_sender,
         &exec_sender,
         nautilus_core::time::get_atomic_clock_realtime(),
         AccountId::from("IB-001"),
@@ -3457,6 +3779,8 @@ async fn test_process_order_update_stream_learns_order_ref_from_execution() {
     let equity = equity_aapl();
     let order_id = 7004;
     let contract_id = 12346;
+    let client = create_test_ib_client(contract_id).await;
+    let (data_sender, _data_receiver) = tokio::sync::mpsc::unbounded_channel();
     let client_order_id = ClientOrderId::from("O-STREAM-EXEC-REF");
     let venue_order_id_map = Arc::new(Mutex::new(AHashMap::new()));
     let instrument_id_map = Arc::new(Mutex::new(AHashMap::new()));
@@ -3505,9 +3829,11 @@ async fn test_process_order_update_stream_learns_order_ref_from_execution() {
 
     InteractiveBrokersExecutionClient::process_order_update_stream(
         &mut subscription,
+        &client,
         &order_id_map,
         &venue_order_id_map,
         &instrument_provider,
+        &data_sender,
         &exec_sender,
         nautilus_core::time::get_atomic_clock_realtime(),
         AccountId::from("IB-001"),
