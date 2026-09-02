@@ -133,17 +133,18 @@ impl UnusualWhalesHttpClient {
             format!("Bearer {}", credential.token()),
         );
         headers.insert("Accept".to_string(), "application/json".to_string());
-        let client = HttpClient::new(
-            headers,
-            RESPONSE_HEADER_NAMES
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
-            Vec::new(),
-            None,
-            Some(config.http_timeout_secs),
-            config.proxy_url.clone(),
-        )?;
+        let client = HttpClient::builder()
+            .headers(headers)
+            .header_keys(
+                RESPONSE_HEADER_NAMES
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+            )
+            .timeout_secs(config.http_timeout_secs)
+            .maybe_proxy_url(config.proxy_url.clone())
+            .rate_limiters(Vec::new())
+            .build()?;
         let retry_manager = RetryManager::new(RetryConfig {
             max_retries: config.max_retries,
             initial_delay_ms: config.retry_delay_initial_ms,

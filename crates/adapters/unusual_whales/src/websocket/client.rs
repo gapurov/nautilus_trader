@@ -26,11 +26,11 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::StreamExt;
 use nautilus_common::{
-    clients::{SocketReconnectHandle, SocketReconnectRequestOutcome},
     live::{runtime::get_runtime, task::TaskHandles},
     messages::DataEvent,
 };
 use nautilus_core::{Params, UUID4, time::get_atomic_clock_realtime};
+use nautilus_live::{SocketControl, SocketReconnectRequestOutcome};
 use nautilus_model::data::{CustomData, Data, DataType};
 use nautilus_network::{
     transport::Message,
@@ -68,6 +68,7 @@ struct Shared {
     subscriptions: SubscriptionState,
     commands: tokio::sync::mpsc::UnboundedSender<WebSocketCommand>,
     data_sender: DataEventSender,
+    socket_control: SocketControl,
     cancellation: CancellationToken,
     reconnecting: AtomicBool,
     active: AtomicBool,
@@ -89,6 +90,26 @@ impl Debug for Shared {
             .field("continuity_sequence", &self.continuity_sequence)
             .finish_non_exhaustive()
     }
+}
+
+fn request_reconnect_outcome(shared: &Shared) -> SocketReconnectRequestOutcome {
+    if shared.cancellation.is_cancelled() {
+        return SocketReconnectRequestOutcome::Closed;
+    }
+
+    if !shared.started.load(Ordering::Acquire) {
+        return SocketReconnectRequestOutcome::Unsupported;
+    }
+
+    if shared.reconnecting.swap(true, Ordering::AcqRel) {
+        return SocketReconnectRequestOutcome::AlreadyReconnecting;
+    }
+
+    if shared.commands.send(WebSocketCommand::Reconnect).is_err() {
+        shared.reconnecting.store(false, Ordering::Release);
+        return SocketReconnectRequestOutcome::Closed;
+    }
+    SocketReconnectRequestOutcome::Accepted
 }
 
 /// Lazy Unusual Whales WebSocket client with adapter-owned coordinated reconnects.
@@ -115,6 +136,7 @@ impl UnusualWhalesWebSocketClient {
         proxy_url: Option<String>,
         credential: Credential,
         gate: DragonflyGate,
+        socket_control: SocketControl,
         data_sender: DataEventSender,
     ) -> Self {
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -127,6 +149,7 @@ impl UnusualWhalesWebSocketClient {
                 subscriptions: SubscriptionState::new(':'),
                 commands,
                 data_sender,
+                socket_control,
                 cancellation: CancellationToken::new(),
                 reconnecting: AtomicBool::new(false),
                 active: AtomicBool::new(false),
@@ -181,31 +204,6 @@ impl UnusualWhalesWebSocketClient {
             .map_err(|()| anyhow::anyhow!("Unusual Whales WebSocket manager is closed"))
     }
 
-    /// Returns a synchronous reconnect control for the socket registry.
-    #[must_use]
-    pub fn reconnect_handle(&self) -> SocketReconnectHandle {
-        let shared = Arc::clone(&self.shared);
-        SocketReconnectHandle::new(move || {
-            if shared.cancellation.is_cancelled() {
-                return SocketReconnectRequestOutcome::Closed;
-            }
-
-            if !shared.started.load(Ordering::Acquire) {
-                return SocketReconnectRequestOutcome::Unsupported;
-            }
-
-            if shared.reconnecting.swap(true, Ordering::AcqRel) {
-                return SocketReconnectRequestOutcome::AlreadyReconnecting;
-            }
-
-            if shared.commands.send(WebSocketCommand::Reconnect).is_err() {
-                shared.reconnecting.store(false, Ordering::Release);
-                return SocketReconnectRequestOutcome::Closed;
-            }
-            SocketReconnectRequestOutcome::Accepted
-        })
-    }
-
     /// Returns whether a current WebSocket transport is active.
     #[must_use]
     pub fn is_active(&self) -> bool {
@@ -220,6 +218,7 @@ impl UnusualWhalesWebSocketClient {
 
     /// Stops the manager, disconnects the current transport, and joins owned tasks.
     pub async fn shutdown(&mut self) {
+        self.shared.socket_control.deregister();
         self.shared.cancellation.cancel();
         let _ = self.shared.commands.send(WebSocketCommand::Shutdown);
 
@@ -236,6 +235,7 @@ impl UnusualWhalesWebSocketClient {
 
     /// Signals shutdown and aborts owned tasks without blocking.
     pub fn shutdown_now(&self) {
+        self.shared.socket_control.deregister();
         self.shared.cancellation.cancel();
         let _ = self.shared.commands.send(WebSocketCommand::Shutdown);
         self.tasks.abort_all_retained();
@@ -257,7 +257,7 @@ impl UnusualWhalesWebSocketClient {
     }
 
     fn request_reconnect(&self) -> Result<SocketReconnectRequestOutcome, ()> {
-        let outcome = self.reconnect_handle().request_reconnect();
+        let outcome = request_reconnect_outcome(&self.shared);
         if outcome == SocketReconnectRequestOutcome::Closed {
             Err(())
         } else {
@@ -435,7 +435,7 @@ async fn wait_for_reconnect_admission(shared: &Shared) -> Result<(), Coordinatio
     }
 }
 
-async fn connect(shared: &Shared) -> Option<(MessageReader, WebSocketClient)> {
+async fn connect(shared: &Arc<Shared>) -> Option<(MessageReader, WebSocketClient)> {
     let mut url = match url::Url::parse(&shared.websocket_url) {
         Ok(url) => url,
         Err(_) => {
@@ -469,8 +469,19 @@ async fn connect(shared: &Shared) -> Option<(MessageReader, WebSocketClient)> {
         }
     };
 
-    match WebSocketClient::connect_stream(config, Vec::new(), None).await {
-        Ok(session) => Some(session),
+    match WebSocketClient::stream_builder()
+        .config(config)
+        .state_sink(shared.socket_control.sink())
+        .connect()
+        .await
+    {
+        Ok(session) => {
+            let reconnect_shared = Arc::clone(shared);
+            shared
+                .socket_control
+                .register(move || request_reconnect_outcome(&reconnect_shared));
+            Some(session)
+        }
         Err(_) => {
             publish_state(
                 shared,

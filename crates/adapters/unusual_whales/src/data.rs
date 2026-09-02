@@ -24,7 +24,7 @@ use std::{
 
 use async_trait::async_trait;
 use nautilus_common::{
-    clients::{DataClient, SocketReconnectRegistration, SocketReconnectRegistry},
+    clients::DataClient,
     live::{runner::get_data_event_sender, runtime::get_runtime, task::TaskHandles},
     messages::{
         DataEvent,
@@ -44,13 +44,13 @@ use nautilus_common::{
     },
 };
 use nautilus_core::datetime::datetime_to_unix_nanos;
+use nautilus_live::SocketControl;
 use nautilus_model::{
     data::{CustomData, DataType},
     identifiers::{ClientId, Venue},
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use ustr::Ustr;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
@@ -117,8 +117,7 @@ pub struct UnusualWhalesDataClient {
     gate: Option<DragonflyGate>,
     http_client: Option<UnusualWhalesHttpClient>,
     websocket_client: Option<UnusualWhalesWebSocketClient>,
-    socket_registry: SocketReconnectRegistry,
-    socket_registration: Option<SocketReconnectRegistration>,
+    socket_control: SocketControl,
 }
 
 impl Debug for UnusualWhalesDataClient {
@@ -130,7 +129,6 @@ impl Debug for UnusualWhalesDataClient {
             .field("dragonfly_url", &"<redacted>")
             .field("is_connected", &self.is_connected)
             .field("tasks", &self.tasks)
-            .field("socket_registry", &self.socket_registry)
             .finish_non_exhaustive()
     }
 }
@@ -171,6 +169,7 @@ impl UnusualWhalesDataClient {
             value.zeroize();
         }
         config.dragonfly_url = None;
+        let socket_control = SocketControl::new(client_id, None, WEBSOCKET_ENDPOINT);
 
         Ok(Self {
             client_id,
@@ -184,8 +183,7 @@ impl UnusualWhalesDataClient {
             gate: None,
             http_client: None,
             websocket_client: None,
-            socket_registry: SocketReconnectRegistry::default(),
-            socket_registration: None,
+            socket_control,
         })
     }
 
@@ -231,7 +229,6 @@ impl UnusualWhalesDataClient {
         if let Some(websocket) = self.websocket_client.as_ref() {
             websocket.shutdown_now();
         }
-        self.socket_registration = None;
         self.is_connected.store(false, Ordering::Release);
     }
 }
@@ -244,10 +241,6 @@ impl DataClient for UnusualWhalesDataClient {
 
     fn venue(&self) -> Option<Venue> {
         None
-    }
-
-    fn socket_reconnect_registry(&self) -> Option<&SocketReconnectRegistry> {
-        Some(&self.socket_registry)
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
@@ -304,12 +297,9 @@ impl DataClient for UnusualWhalesDataClient {
             self.config.proxy_url.clone(),
             self.credential.clone(),
             gate.clone(),
+            self.socket_control.clone(),
             self.data_sender.clone(),
         );
-        self.socket_registration = Some(self.socket_registry.register(
-            Ustr::from(WEBSOCKET_ENDPOINT),
-            websocket_client.reconnect_handle(),
-        ));
         self.gate = Some(gate);
         self.http_client = Some(http_client);
         self.websocket_client = Some(websocket_client);
@@ -335,7 +325,6 @@ impl DataClient for UnusualWhalesDataClient {
                 Err(e) => log::warn!("Unusual Whales REST task failed during shutdown: {e}"),
             }
         }
-        self.socket_registration = None;
         self.websocket_client = None;
         self.http_client = None;
         self.gate = None;
@@ -467,10 +456,9 @@ mod tests {
     }
 
     #[rstest]
-    fn venue_is_none_and_routing_is_client_explicit() {
+    fn venue_is_none() {
         let client = test_client();
         assert_eq!(client.venue(), None);
-        assert!(client.socket_reconnect_registry().is_some());
     }
 
     #[rstest]
