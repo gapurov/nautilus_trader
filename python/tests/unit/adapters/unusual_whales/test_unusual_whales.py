@@ -12,11 +12,14 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Check the Unusual Whales Python interface and custom data.
+"""
 
 import ast
 from pathlib import Path
 
-import nautilus_trader.adapters.unusual_whales as unusual_whales
+from nautilus_trader.adapters import unusual_whales
 from nautilus_trader.adapters.unusual_whales import CHANNEL_FORM_COUNT
 from nautilus_trader.adapters.unusual_whales import OPERATION_COUNT
 from nautilus_trader.adapters.unusual_whales import UnusualWhalesDataClientConfig
@@ -31,6 +34,9 @@ from nautilus_trader.model import TraderId
 
 
 def test_import_surface_and_generated_contract_counts() -> None:
+    """
+    Check exported names and generated contract counts.
+    """
     assert OPERATION_COUNT == 215
     assert CHANNEL_FORM_COUNT == 28
     assert len(unusual_whales_operation_ids()) == 215
@@ -41,6 +47,9 @@ def test_import_surface_and_generated_contract_counts() -> None:
 
 
 def test_config_and_factory_redact_secrets() -> None:
+    """
+    Check that configuration output omits credentials.
+    """
     config = UnusualWhalesDataClientConfig(
         api_key="secret-token",
         dragonfly_url="redis://user:secret@127.0.0.1:6379/",
@@ -52,6 +61,9 @@ def test_config_and_factory_redact_secrets() -> None:
 
 
 def test_builder_registers_explicit_non_default_data_client() -> None:
+    """
+    Check explicit client registration without default routing.
+    """
     builder = LiveNode.builder(
         "UW-BUILDER-TEST",
         TraderId.from_str("TESTER-001"),
@@ -70,6 +82,9 @@ def test_builder_registers_explicit_non_default_data_client() -> None:
 
 
 def test_custom_data_python_conversion_preserves_exact_frame() -> None:
+    """
+    Check that custom data retains the original frame.
+    """
     frame = '{"channel":"price:AAPL","provider_ts":123}'
     event = UnusualWhalesWebSocketEvent(
         channel="price:AAPL",
@@ -87,6 +102,9 @@ def test_custom_data_python_conversion_preserves_exact_frame() -> None:
 
 
 def test_stub_exports_match_runtime_facade() -> None:
+    """
+    Check that generated exports match the Python interface.
+    """
     stub_path = Path(unusual_whales.__file__).with_name("__init__.pyi")
     module = ast.parse(stub_path.read_text())
     assignment = next(
@@ -96,5 +114,5 @@ def test_stub_exports_match_runtime_facade() -> None:
         and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
     )
     assert isinstance(assignment.value, ast.List)
-    stub_exports = [element.value for element in assignment.value.elts]
+    stub_exports = ast.literal_eval(assignment.value)
     assert stub_exports == unusual_whales.__all__

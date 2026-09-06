@@ -532,7 +532,7 @@ await client.submit_split_outcome(50, Decimal("1.0"))
 # Burn a matched Yes + No pair back to USDH (amount=None merges the max)
 await client.submit_merge_outcome(50, None)
 
-# Multi-outcome priceBucket helpers
+# Multi-outcome priceBucket operations
 await client.submit_merge_question(9, None)
 await client.submit_negate_outcome(9, 52, Decimal("1.0"))
 ```
@@ -1389,11 +1389,124 @@ Hyperliquid perpetual futures use a fixed 1-hour funding interval. The adapter s
 
 ## Rate limiting
 
-The adapter implements a token bucket rate limiter for Hyperliquid's REST API with a capacity
-of 1200 weight per minute. HTTP info requests are automatically retried with exponential
-backoff (full jitter) on rate limit (429) and server error (5xx) responses.
-For WebSocket post trading requests, the adapter caps simultaneous inflight messages at 100 to
-match the venue limit.
+Hyperliquid applies limits by IP address and user address. The adapter uses the fixed venue limits
+from the [Hyperliquid rate limits documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits).
+It does not expose higher overrides.
+
+### REST limits
+
+#### Sharing scope
+
+The adapter shares one 1,200-weight-per-minute token bucket among clients in the same process when
+their environment, HTTP endpoint origin, and proxy route match. The `/info` and `/exchange` paths
+on one origin consume the same bucket.
+
+Separate processes, programs, proxy routes, and HTTP clients outside this adapter do not coordinate
+through the in-memory bucket. Deployments that share an egress IP must leave capacity for that
+traffic.
+
+#### Request weights
+
+| Endpoint    | Request                  | Base weight                    |
+| ----------- | ------------------------ | -----------------------------: |
+| `/exchange` | All actions              | `1 + floor(batch length / 40)` |
+| `/info`     | `l2Book`                 |                              2 |
+| `/info`     | `allMids`                |                              2 |
+| `/info`     | `clearinghouseState`     |                              2 |
+| `/info`     | `orderStatus`            |                              2 |
+| `/info`     | `spotClearinghouseState` |                              2 |
+| `/info`     | `exchangeStatus`         |                              2 |
+| `/info`     | `userRole`               |                             60 |
+| `/info`     | All other requests       |                             20 |
+
+An order or cancel batch counts as one IP request. Some `/info` responses add weight based on the
+number of returned items:
+
+| Data                      | Requests                                                        | Added weight             |
+| ------------------------- | --------------------------------------------------------------- | -----------------------: |
+| Candles                   | `candleSnapshot`                                                | +1 per 60 returned items |
+| Trades and orders         | `recentTrades`, `historicalOrders`                              | +1 per 20 returned items |
+| Fills                     | `userFills`, `userFillsByTime`                                  | +1 per 20 returned items |
+| Funding                   | `fundingHistory`, `userFunding`, `nonUserFundingUpdates`        | +1 per 20 returned items |
+| TWAP                      | `twapHistory`, `userTwapSliceFills`, `userTwapSliceFillsByTime` | +1 per 20 returned items |
+| Delegators and validators | `delegatorHistory`, `delegatorRewards`, `validatorStats`        | +1 per 20 returned items |
+
+#### Retries
+
+Each HTTP attempt consumes its full request weight.
+
+| Request or response                         | Behavior                                |
+| ------------------------------------------- | --------------------------------------- |
+| HTTP 408, 429, or 5xx from `/info`          | Retry up to three times.                |
+| HTTP 429 with integer-seconds `Retry-After` | Use the header value as the delay.      |
+| Retryable response without a valid delay    | Use capped full-jitter backoff.         |
+| Response failure from `/exchange`           | No retry; venue outcome may be unknown. |
+
+### WebSocket limits
+
+#### Sharing scope
+
+Clients in the same process share WebSocket limits when their environment, WebSocket endpoint
+origin, and proxy route match.
+
+#### Enforced limits
+
+| Limit             | Maximum      | Applies to                                                       |
+| ----------------- | -----------: | ---------------------------------------------------------------- |
+| Outbound messages | 2,000/minute | Subscriptions, unsubscriptions, posts, heartbeats, and pongs.    |
+| In-flight posts   |          100 | Simultaneous post requests.                                      |
+| Connections       |           10 | Simultaneous connections.                                        |
+| New connections   |    30/minute | Initial connections and reconnect attempts.                      |
+| Subscriptions     |        1,000 | Active and pending subscriptions.                                |
+| Unique users      |           10 | User-specific subscriptions; addresses match case-insensitively. |
+
+#### Reconnects and releases
+
+Automatic reconnects retain the logical connection slot and active subscription reservations.
+They still consume the new-connection rate. A confirmed unsubscribe, explicit client disconnect,
+or terminal handler exit releases the corresponding subscription reservations.
+
+#### Post deadlines and retries
+
+WebSocket post requests use one caller deadline while waiting for an in-flight slot, the command
+channel, the outbound-message quota, the active connection, and the response. The client retries a
+post send only when the network layer proves that writing did not start. A write timeout or broken
+connection after writing starts has an unknown venue outcome, so the adapter returns the error and
+does not resend the action.
+
+### Address and exchange limits
+
+Hyperliquid also enforces server-side limits that one adapter process cannot calculate reliably.
+
+#### Action limits
+
+Each address starts with 10,000 action requests and accrues one request per cumulative USDC traded.
+Once limited, the address may send one request every 10 seconds. Subaccounts have independent
+limits.
+
+#### Cancel allowance
+
+Cancels receive `min(action limit + 100,000, action limit * 2)` requests. A batch of `n` actions
+consumes one IP request but `n` address requests.
+
+#### Open-order limits
+
+Each address starts with 1,000 open orders, gains one additional order per $5 million of cumulative
+volume, and is capped at 5,000. Hyperliquid rejects a new reduce-only or trigger order when the
+address already has at least 1,000 other open orders.
+
+#### Congestion
+
+During congestion, an address's prior UTC-day maker share and the asset's fee tier determine its
+block-space allowance. Do not resend a cancel after Hyperliquid returns a response.
+
+#### Enforcement boundary
+
+Hyperliquid remains authoritative for these limits because volume, open orders, and requests can
+come from other processes and clients. Venue rejections are returned to the caller.
+
+The adapter does not use Hyperliquid's explorer API or the official EVM JSON-RPC endpoint. Their
+separate weights and request limits therefore remain outside this adapter's limiter.
 
 ## Configuration
 
@@ -1451,7 +1564,9 @@ effect yet. See [Instrument loading](#instrument-loading) for how to refresh the
 `HyperliquidExecutionClientConfig` Python constructor and always uses its default. The
 `max_retries`, `retry_delay_initial_ms`, and `retry_delay_max_ms` fields are accepted on
 both the Rust and Python config but are not yet consumed by the execution client (its HTTP
-client is constructed with only the request timeout and proxy).
+client is constructed with only the request timeout and proxy). These fields do not change the
+bounded read-only REST retries or the pre-write-only WebSocket post retries described in
+[Rate limiting](#rate-limiting).
 :::
 
 ### Live node configuration

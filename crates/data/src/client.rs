@@ -30,14 +30,14 @@ use nautilus_common::{
     enums::LogColor,
     log_info,
     messages::data::{
-        RequestBars, RequestBookDepth, RequestBookSnapshot, RequestCustomData,
-        RequestForwardPrices, RequestFundingRates, RequestInstrument, RequestInstruments,
-        RequestQuotes, RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10,
-        SubscribeCommand, SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices,
-        SubscribeInstrument, SubscribeInstrumentClose, SubscribeInstrumentStatus,
-        SubscribeInstruments, SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes,
-        SubscribeTrades, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10,
-        UnsubscribeCommand, UnsubscribeCustomData, UnsubscribeFundingRates, UnsubscribeIndexPrices,
+        RequestBars, RequestBookDepth, RequestBookSnapshot, RequestCustomData, RequestFundingRates,
+        RequestInstrument, RequestInstruments, RequestOptionChainReferencePrice, RequestQuotes,
+        RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeCommand,
+        SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+        SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
+        SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
+        UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeCommand,
+        UnsubscribeCustomData, UnsubscribeFundingRates, UnsubscribeIndexPrices,
         UnsubscribeInstrument, UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus,
         UnsubscribeInstruments, UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes,
         UnsubscribeTrades,
@@ -782,13 +782,16 @@ impl DataClientAdapter {
         self.client.request_funding_rates(req)
     }
 
-    /// Sends a forward prices request for derivatives instruments.
+    /// Sends an option-chain reference price request.
     ///
     /// # Errors
     ///
-    /// Returns an error if the client fails to process the forward prices request.
-    pub fn request_forward_prices(&self, req: RequestForwardPrices) -> anyhow::Result<()> {
-        self.client.request_forward_prices(req)
+    /// Returns an error if the client fails to process the option-chain reference price request.
+    pub fn request_option_chain_reference_price(
+        &self,
+        req: RequestOptionChainReferencePrice,
+    ) -> anyhow::Result<()> {
+        self.client.request_option_chain_reference_price(req)
     }
 
     /// Sends a bars request for a given instrument and bar type.

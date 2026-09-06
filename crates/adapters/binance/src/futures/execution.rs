@@ -45,6 +45,7 @@ use nautilus_core::{
         NANOSECONDS_IN_DAY, NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND,
         checked_mins_to_nanos,
     },
+    string::secret::SecretString,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{
@@ -181,8 +182,8 @@ pub struct BinanceFuturesExecutionClient {
     ws_client: Arc<Mutex<Option<BinanceFuturesWebSocketClient>>>,
     socket_factory: SocketControlFactory,
     ws_trading_client: Option<BinanceFuturesWsTradingClient>,
-    listen_key: Arc<RwLock<Option<String>>>,
-    recovery_listen_key: Arc<RwLock<Option<String>>>,
+    listen_key: Arc<RwLock<Option<SecretString>>>,
+    recovery_listen_key: Arc<RwLock<Option<SecretString>>>,
     cancellation_token: CancellationToken,
     triggered_algo_order_ids: Arc<AtomicSet<ClientOrderId>>,
     algo_client_order_ids: Arc<AtomicSet<ClientOrderId>>,
@@ -218,11 +219,21 @@ impl BinanceFuturesExecutionClient {
         }
 
         let (api_key, api_secret) = resolve_credentials(
-            config.api_key.clone(),
-            config.api_secret.clone(),
+            config
+                .api_key
+                .as_ref()
+                .map(|value| value.expose_secret().to_owned()),
+            config
+                .api_secret
+                .as_ref()
+                .map(|value| value.expose_secret().to_owned()),
             config.environment,
             product_type,
         )?;
+        let proxy_url = config
+            .proxy_url
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
 
         let clock = get_atomic_clock_realtime();
         let socket_factory = SocketControlFactory::new(core.client_id, Some(*BINANCE_VENUE));
@@ -236,7 +247,7 @@ impl BinanceFuturesExecutionClient {
             config.base_url_http.clone(),
             Some(config.recv_window_ms),
             None, // timeout_secs
-            config.proxy_url.clone(),
+            proxy_url.clone(),
             config.treat_expired_as_canceled,
         )
         .context("failed to construct Binance Futures HTTP client")?;
@@ -262,7 +273,7 @@ impl BinanceFuturesExecutionClient {
                     Some(BINANCE_WS_HEARTBEAT_SECS),
                     config.transport_backend,
                 )
-                .with_proxy(config.proxy_url.clone())
+                .with_proxy(proxy_url)
                 .with_recv_window(Some(config.recv_window_ms))
                 .with_socket_control(socket_factory.control("binance-futures-trading")),
             )
@@ -944,7 +955,7 @@ impl BinanceFuturesExecutionClient {
 
     async fn close_listen_key_slot(
         &self,
-        slot: &RwLock<Option<String>>,
+        slot: &RwLock<Option<SecretString>>,
         context: &str,
     ) -> anyhow::Result<()> {
         let key = slot.read().clone();
@@ -953,11 +964,11 @@ impl BinanceFuturesExecutionClient {
         };
 
         self.http_client
-            .close_listen_key(&key)
+            .close_listen_key(key.expose_secret())
             .await
             .with_context(|| context.to_string())?;
         let mut owned = slot.write();
-        if owned.as_deref() == Some(key.as_str()) {
+        if owned.as_ref().map(SecretString::expose_secret) == Some(key.expose_secret()) {
             *owned = None;
         }
         Ok(())
@@ -1318,15 +1329,9 @@ fn resolve_order_position_identity(
     is_hedge_mode: bool,
     use_position_ids: bool,
     order: &OrderAny,
-    close_position: bool,
 ) -> anyhow::Result<(Option<BinancePositionSide>, Option<PositionId>)> {
-    // `close_position` retires an entire hedge leg, so it carries close intent on its own
-    // and cannot be combined with `reduce_only`, which otherwise selects the closing side.
-    let position_side = determine_position_side(
-        is_hedge_mode,
-        order.order_side(),
-        order.is_reduce_only() || close_position,
-    );
+    let position_side =
+        determine_position_side(is_hedge_mode, order.order_side(), order.is_reduce_only());
     let venue_position_id = make_venue_position_id(
         use_position_ids,
         order.instrument_id(),
@@ -1757,7 +1762,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             .create_listen_key()
             .await
             .context("failed to create listen key")?;
-        let listen_key = listen_key_response.listen_key;
+        let listen_key = listen_key_response.into_listen_key();
         log::debug!("Listen key created successfully");
 
         {
@@ -1766,8 +1771,14 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         }
 
         let (api_key, api_secret) = resolve_credentials(
-            self.config.api_key.clone(),
-            self.config.api_secret.clone(),
+            self.config
+                .api_key
+                .as_ref()
+                .map(|value| value.expose_secret().to_owned()),
+            self.config
+                .api_secret
+                .as_ref()
+                .map(|value| value.expose_secret().to_owned()),
             self.config.environment,
             self.product_type,
         )?;
@@ -1812,15 +1823,16 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         let ws_build_params = WsBuildParams {
             product_type: self.product_type,
             environment: self.config.environment,
-            api_key: api_key.clone(),
-            api_secret: api_secret.clone(),
+            api_key: SecretString::from(api_key.clone()),
+            api_secret: SecretString::from(api_secret.clone()),
             private_base_url: private_base_url.clone(),
             transport_backend: self.config.transport_backend,
             proxy_url: self.config.proxy_url.clone(),
             socket_factory: self.socket_factory.clone(),
         };
 
-        let ws_client = build_and_connect_user_stream(&ws_build_params, &listen_key).await?;
+        let ws_client =
+            build_and_connect_user_stream(&ws_build_params, listen_key.expose_secret()).await?;
         let stream = ws_client.stream();
         *self.ws_client.lock() = Some(ws_client);
 
@@ -1856,7 +1868,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                             };
 
                             if let Some(ref key) = key {
-                                match http_client.keepalive_listen_key(key).await {
+                                match http_client.keepalive_listen_key(key.expose_secret()).await {
                                     Ok(()) => {
                                         log::debug!("Listen key keepalive sent successfully");
                                         consecutive_failures = 0;
@@ -3068,78 +3080,17 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             return Ok(());
         }
 
-        // Validate before submission (Initialized -> Denied is valid,
-        // but Submitted -> Denied is not, so validate before emitting OrderSubmitted)
-        if let Some(offset_type) = order.trailing_offset_type() {
-            if offset_type != TrailingOffsetType::BasisPoints {
-                anyhow::bail!(
-                    "Binance only supports TrailingOffsetType::BasisPoints, received {offset_type:?}"
-                );
-            }
-
-            if let Some(offset) = order.trailing_offset() {
-                trailing_offset_to_callback_rate(offset)?;
-            }
-        }
-
-        let close_position = cmd
-            .params
-            .as_ref()
-            .and_then(|p| p.get_bool(PARAMS_CLOSE_POSITION))
-            .unwrap_or(false);
-
-        if close_position {
-            let order_type = order.order_type();
-
-            if !matches!(
-                order_type,
-                OrderType::StopMarket | OrderType::MarketIfTouched
-            ) {
-                anyhow::bail!(
-                    "`close_position` is not supported for order type {order_type:?} on Binance"
-                );
-            }
-
-            if order.is_reduce_only() {
-                anyhow::bail!("`close_position` cannot be combined with `reduce_only` on Binance");
-            }
-        }
-
-        if let Some(pm_str) = cmd.params.as_ref().and_then(|p| p.get_str("price_match")) {
-            BinancePriceMatch::from_param(pm_str)?;
-            let order_type = order.order_type();
-            anyhow::ensure!(
-                !order.is_post_only(),
-                "price_match cannot be combined with post-only orders"
-            );
-            anyhow::ensure!(
-                order_type == OrderType::Limit,
-                "price_match is not supported for order type {order_type:?}"
-            );
-        }
-
-        let lifetime = determine_futures_order_lifetime(
-            self.product_type,
-            order.order_type(),
-            order.time_in_force(),
-            order.expire_time(),
-            order.is_post_only(),
-            self.config.use_gtd,
-            self.clock.get_time_ns(),
-        )?;
-
-        let (position_side, venue_position_id) = resolve_order_position_identity(
-            self.is_hedge_mode(),
-            self.config.use_position_ids,
-            &order,
-            close_position,
-        )?;
-        validate_submit_position_id(cmd.position_id, venue_position_id)?;
+        let validated = validate_order(self, &cmd, &order)?;
 
         log::debug!("OrderSubmitted client_order_id={}", order.client_order_id());
         self.emitter.emit_order_submitted(&order);
 
-        self.submit_order_internal(&cmd, lifetime, position_side, venue_position_id)
+        self.submit_order_internal(
+            &cmd,
+            validated.lifetime,
+            validated.position_side,
+            validated.venue_position_id,
+        )
     }
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
@@ -3204,7 +3155,6 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                     self.is_hedge_mode(),
                     self.config.use_position_ids,
                     order,
-                    close_position,
                 )
                 .map(|(_, venue_position_id)| venue_position_id)
             })
@@ -3684,6 +3634,89 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
         Ok(())
     }
+}
+
+fn validate_order(
+    client: &BinanceFuturesExecutionClient,
+    cmd: &SubmitOrder,
+    order: &OrderAny,
+) -> anyhow::Result<ValidatedOrder> {
+    if let Some(offset_type) = order.trailing_offset_type() {
+        anyhow::ensure!(
+            offset_type == TrailingOffsetType::BasisPoints,
+            "Binance only supports TrailingOffsetType::BasisPoints, received {offset_type:?}"
+        );
+
+        if let Some(offset) = order.trailing_offset() {
+            trailing_offset_to_callback_rate(offset)?;
+        }
+    }
+
+    let close_position = cmd
+        .params
+        .as_ref()
+        .and_then(|params| params.get_bool(PARAMS_CLOSE_POSITION))
+        .unwrap_or(false);
+
+    if close_position {
+        let order_type = order.order_type();
+        anyhow::ensure!(
+            order.is_reduce_only(),
+            "`close_position` requires `reduce_only=true` on the Nautilus order"
+        );
+        anyhow::ensure!(
+            matches!(
+                order_type,
+                OrderType::StopMarket | OrderType::MarketIfTouched
+            ),
+            "`close_position` is not supported for order type {order_type:?} on Binance"
+        );
+    }
+
+    if let Some(price_match) = cmd
+        .params
+        .as_ref()
+        .and_then(|params| params.get_str("price_match"))
+    {
+        BinancePriceMatch::from_param(price_match)?;
+        let order_type = order.order_type();
+        anyhow::ensure!(
+            !order.is_post_only(),
+            "price_match cannot be combined with post-only orders"
+        );
+        anyhow::ensure!(
+            order_type == OrderType::Limit,
+            "price_match is not supported for order type {order_type:?}"
+        );
+    }
+
+    let lifetime = determine_futures_order_lifetime(
+        client.product_type,
+        order.order_type(),
+        order.time_in_force(),
+        order.expire_time(),
+        order.is_post_only(),
+        client.config.use_gtd,
+        client.clock.get_time_ns(),
+    )?;
+    let (position_side, venue_position_id) = resolve_order_position_identity(
+        client.is_hedge_mode(),
+        client.config.use_position_ids,
+        order,
+    )?;
+    validate_submit_position_id(cmd.position_id, venue_position_id)?;
+
+    Ok(ValidatedOrder {
+        lifetime,
+        position_side,
+        venue_position_id,
+    })
+}
+
+struct ValidatedOrder {
+    lifetime: FuturesOrderLifetime,
+    position_side: Option<BinancePositionSide>,
+    venue_position_id: Option<PositionId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

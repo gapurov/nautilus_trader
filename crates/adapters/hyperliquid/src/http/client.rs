@@ -34,6 +34,7 @@ use nautilus_core::{
     AtomicMap, UUID4, UnixNanos,
     consts::NAUTILUS_USER_AGENT,
     datetime::datetime_to_unix_nanos,
+    string::secret::SecretString,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
@@ -61,7 +62,10 @@ use ustr::Ustr;
 use crate::{
     account::resolve_execution_account_address,
     common::{
-        consts::{HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS, exchange_url, info_url},
+        consts::{
+            HYPERLIQUID_REST_WEIGHT_PER_MINUTE, HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS,
+            exchange_url, info_url,
+        },
         credential::{Secrets, VaultAddress, credential_env_vars},
         enums::{
             HyperliquidBarInterval, HyperliquidEnvironment,
@@ -106,7 +110,7 @@ use crate::{
         query::{ExchangeAction, InfoRequest},
         rate_limits::{
             RateLimitSnapshot, WeightedLimiter, backoff_full_jitter, exchange_weight,
-            exec_action_weight, info_base_weight, info_extra_weight,
+            exec_action_weight, info_base_weight, info_extra_weight, shared_rest_limiter,
         },
     },
     signing::{
@@ -166,11 +170,19 @@ const fn historical_status_priority(status: OrderStatus) -> u8 {
     }
 }
 
-// https://hyperliquid.xyz/docs/api#rate-limits
-pub static HYPERLIQUID_REST_QUOTA: LazyLock<Quota> =
-    LazyLock::new(|| Quota::per_minute(NonZeroU32::new(1200).unwrap()));
+/// Unweighted REST quota retained for compatibility with existing callers.
+///
+/// Adapter clients use a shared weighted limiter because Hyperliquid aggregates request weights
+/// across `/info` and `/exchange`.
+pub static HYPERLIQUID_REST_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
+    Quota::per_minute(NonZeroU32::new(HYPERLIQUID_REST_WEIGHT_PER_MINUTE).unwrap())
+});
 
 const HYPERLIQUID_RECENT_HISTORY_LIMIT: usize = 2_000;
+const RATE_LIMIT_BACKOFF_BASE: Duration = Duration::from_millis(125);
+const RATE_LIMIT_BACKOFF_CAP: Duration = Duration::from_secs(5);
+const RATE_LIMIT_INFO_RETRIES_MAX: u32 = 3;
+const RETRY_AFTER_HEADER: &str = "retry-after";
 const VAULT_TOKEN_PREFIX: &str = "vntls:";
 
 /// Provides a raw HTTP client for low-level Hyperliquid REST API operations.
@@ -190,10 +202,9 @@ pub struct HyperliquidRawHttpClient {
     signer: Option<HyperliquidEip712Signer>,
     nonce_manager: Option<Arc<NonceManager>>,
     vault_address: Option<VaultAddress>,
-    rest_limiter: Arc<WeightedLimiter>,
-    rate_limit_backoff_base: Duration,
-    rate_limit_backoff_cap: Duration,
-    rate_limit_max_attempts_info: u32,
+    proxy_url: Option<SecretString>,
+    info_limiter: Arc<WeightedLimiter>,
+    exchange_limiter: Arc<WeightedLimiter>,
 }
 
 impl HyperliquidRawHttpClient {
@@ -207,23 +218,23 @@ impl HyperliquidRawHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> std::result::Result<Self, HttpClientError> {
+        let base_info = info_url(environment).to_string();
+        let base_exchange = exchange_url(environment).to_string();
+        let info_limiter = shared_rest_limiter(environment, &base_info, proxy_url.as_deref());
+        let exchange_limiter =
+            shared_rest_limiter(environment, &base_exchange, proxy_url.as_deref());
+
         Ok(Self {
-            client: HttpClient::builder()
-                .headers(Self::default_headers())
-                .default_quota(*HYPERLIQUID_REST_QUOTA)
-                .timeout_secs(timeout_secs)
-                .maybe_proxy_url(proxy_url)
-                .build()?,
+            client: Self::build_http_client(timeout_secs, proxy_url.clone())?,
             environment,
-            base_info: info_url(environment).to_string(),
-            base_exchange: exchange_url(environment).to_string(),
+            base_info,
+            base_exchange,
             signer: None,
             nonce_manager: None,
             vault_address: None,
-            rest_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
-            rate_limit_backoff_base: Duration::from_millis(125),
-            rate_limit_backoff_cap: Duration::from_secs(5),
-            rate_limit_max_attempts_info: 3,
+            proxy_url: proxy_url.map(SecretString::from),
+            info_limiter,
+            exchange_limiter,
         })
     }
 
@@ -241,34 +252,44 @@ impl HyperliquidRawHttpClient {
         let signer = HyperliquidEip712Signer::new(&secrets.private_key)
             .map_err(|e| HttpClientError::from(e.to_string()))?;
         let nonce_manager = Arc::new(NonceManager::new());
+        let base_info = info_url(secrets.environment).to_string();
+        let base_exchange = exchange_url(secrets.environment).to_string();
+        let info_limiter =
+            shared_rest_limiter(secrets.environment, &base_info, proxy_url.as_deref());
+        let exchange_limiter =
+            shared_rest_limiter(secrets.environment, &base_exchange, proxy_url.as_deref());
 
         Ok(Self {
-            client: HttpClient::builder()
-                .headers(Self::default_headers())
-                .default_quota(*HYPERLIQUID_REST_QUOTA)
-                .timeout_secs(timeout_secs)
-                .maybe_proxy_url(proxy_url)
-                .build()?,
+            client: Self::build_http_client(timeout_secs, proxy_url.clone())?,
             environment: secrets.environment,
-            base_info: info_url(secrets.environment).to_string(),
-            base_exchange: exchange_url(secrets.environment).to_string(),
+            base_info,
+            base_exchange,
             signer: Some(signer),
             nonce_manager: Some(nonce_manager),
             vault_address: secrets.vault_address,
-            rest_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
-            rate_limit_backoff_base: Duration::from_millis(125),
-            rate_limit_backoff_cap: Duration::from_secs(5),
-            rate_limit_max_attempts_info: 3,
+            proxy_url: proxy_url.map(SecretString::from),
+            info_limiter,
+            exchange_limiter,
         })
     }
 
     /// Overrides the base info URL (for testing with mock servers).
     pub fn set_base_info_url(&mut self, url: String) {
+        self.info_limiter = shared_rest_limiter(
+            self.environment,
+            &url,
+            self.proxy_url.as_ref().map(|value| value.expose_secret()),
+        );
         self.base_info = url;
     }
 
     /// Overrides the base exchange URL (for testing with mock servers).
     pub fn set_base_exchange_url(&mut self, url: String) {
+        self.exchange_limiter = shared_rest_limiter(
+            self.environment,
+            &url,
+            self.proxy_url.as_ref().map(|value| value.expose_secret()),
+        );
         self.base_exchange = url;
     }
 
@@ -302,13 +323,13 @@ impl HyperliquidRawHttpClient {
             .map_err(|e| Error::auth(format!("Failed to create HTTP client: {e}")))
     }
 
-    /// Configure rate limiting parameters (chainable).
+    /// Rebinds the client to the shared rate limits for its configured routes.
     #[must_use]
     pub fn with_rate_limits(mut self) -> Self {
-        self.rest_limiter = Arc::new(WeightedLimiter::per_minute(1200));
-        self.rate_limit_backoff_base = Duration::from_millis(125);
-        self.rate_limit_backoff_cap = Duration::from_secs(5);
-        self.rate_limit_max_attempts_info = 3;
+        let proxy_url = self.proxy_url.as_ref().map(|value| value.expose_secret());
+        self.info_limiter = shared_rest_limiter(self.environment, &self.base_info, proxy_url);
+        self.exchange_limiter =
+            shared_rest_limiter(self.environment, &self.base_exchange, proxy_url);
         self
     }
 
@@ -356,6 +377,19 @@ impl HyperliquidRawHttpClient {
         }
     }
 
+    fn build_http_client(
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+    ) -> std::result::Result<HttpClient, HttpClientError> {
+        HttpClient::builder()
+            .headers(Self::default_headers())
+            .header_keys(vec![RETRY_AFTER_HEADER.to_string()])
+            .rate_limiters(Vec::new())
+            .timeout_secs(timeout_secs)
+            .maybe_proxy_url(proxy_url)
+            .build()
+    }
+
     fn default_headers() -> HashMap<String, String> {
         HashMap::from([
             (USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string()),
@@ -367,9 +401,12 @@ impl HyperliquidRawHttpClient {
         SignerId("hyperliquid:default".into())
     }
 
-    fn parse_retry_after_simple(&self, headers: &HashMap<String, String>) -> Option<u64> {
-        let retry_after = headers.get("retry-after")?;
-        retry_after.parse::<u64>().ok().map(|s| s * 1000) // convert seconds to ms
+    fn retry_after_ms(headers: &HashMap<String, String>) -> Option<u64> {
+        let retry_after = headers.get(RETRY_AFTER_HEADER)?;
+        retry_after
+            .parse::<u64>()
+            .ok()
+            .map(|seconds| seconds.saturating_mul(1_000))
     }
 
     /// Get metadata about available markets.
@@ -556,11 +593,10 @@ impl HyperliquidRawHttpClient {
 
     async fn send_info_request(&self, request: &InfoRequest) -> Result<Value> {
         let base_w = info_base_weight(request);
-        self.rest_limiter.acquire(base_w).await;
-
         let mut attempt = 0u32;
 
         loop {
+            self.info_limiter.acquire(base_w).await;
             let response = self.http_roundtrip_info(request).await?;
 
             if response.status.is_success() {
@@ -568,7 +604,7 @@ impl HyperliquidRawHttpClient {
                 let val: Value = serde_json::from_slice(&response.body).map_err(Error::Serde)?;
                 let extra = info_extra_weight(request, &val);
                 if extra > 0 {
-                    self.rest_limiter.debit_extra(extra).await;
+                    self.info_limiter.debit_extra(extra).await;
                     log::debug!(
                         "Info debited extra weight: endpoint={request:?}, base_w={base_w}, extra={extra}"
                     );
@@ -576,44 +612,37 @@ impl HyperliquidRawHttpClient {
                 return Ok(val);
             }
 
-            // 429 → respect Retry-After; else jittered backoff. Retry Info only.
+            // Retry Info requests after 429 responses, honoring Retry-After when present
             if response.status.as_u16() == 429 {
-                if attempt >= self.rate_limit_max_attempts_info {
-                    let ra = self.parse_retry_after_simple(&response.headers);
+                if attempt >= RATE_LIMIT_INFO_RETRIES_MAX {
+                    let ra = Self::retry_after_ms(&response.headers);
                     return Err(Error::rate_limit("info", base_w, ra));
                 }
-                let delay = self
-                    .parse_retry_after_simple(&response.headers)
-                    .map_or_else(
-                        || {
-                            backoff_full_jitter(
-                                attempt,
-                                self.rate_limit_backoff_base,
-                                self.rate_limit_backoff_cap,
-                            )
-                        },
-                        Duration::from_millis,
-                    );
+                let delay = Self::retry_after_ms(&response.headers).map_or_else(
+                    || {
+                        backoff_full_jitter(
+                            attempt,
+                            RATE_LIMIT_BACKOFF_BASE,
+                            RATE_LIMIT_BACKOFF_CAP,
+                        )
+                    },
+                    Duration::from_millis,
+                );
                 log::warn!(
                     "429 Too Many Requests; backing off: endpoint={request:?}, attempt={attempt}, wait_ms={:?}",
                     delay.as_millis()
                 );
                 attempt += 1;
                 tokio::time::sleep(delay).await;
-                // tiny re-acquire to avoid stampede exactly on minute boundary
-                self.rest_limiter.acquire(1).await;
                 continue;
             }
 
             // transient 5xx: treat like retryable Info (bounded)
             if (response.status.is_server_error() || response.status.as_u16() == 408)
-                && attempt < self.rate_limit_max_attempts_info
+                && attempt < RATE_LIMIT_INFO_RETRIES_MAX
             {
-                let delay = backoff_full_jitter(
-                    attempt,
-                    self.rate_limit_backoff_base,
-                    self.rate_limit_backoff_cap,
-                );
+                let delay =
+                    backoff_full_jitter(attempt, RATE_LIMIT_BACKOFF_BASE, RATE_LIMIT_BACKOFF_CAP);
                 log::warn!(
                     "Transient error; retrying: endpoint={request:?}, attempt={attempt}, status={:?}, wait_ms={:?}",
                     response.status.as_u16(),
@@ -660,7 +689,7 @@ impl HyperliquidRawHttpClient {
         action: &ExchangeAction,
     ) -> Result<HyperliquidExchangeResponse> {
         let w = exchange_weight(action);
-        self.rest_limiter.acquire(w).await;
+        self.exchange_limiter.acquire(w).await;
 
         let signer = self
             .signer
@@ -730,7 +759,7 @@ impl HyperliquidRawHttpClient {
                 _ => Ok(parsed_response),
             }
         } else if response.status.as_u16() == 429 {
-            let ra = self.parse_retry_after_simple(&response.headers);
+            let ra = Self::retry_after_ms(&response.headers);
             Err(Error::rate_limit("exchange", w, ra))
         } else {
             let error_body = String::from_utf8_lossy(&response.body);
@@ -806,7 +835,7 @@ impl HyperliquidRawHttpClient {
         action: &HyperliquidExchangeAction,
     ) -> Result<HyperliquidExchangeResponse> {
         let w = exec_action_weight(action);
-        self.rest_limiter.acquire(w).await;
+        self.exchange_limiter.acquire(w).await;
 
         let request = self.sign_action_exec_request(action, None)?;
 
@@ -835,7 +864,7 @@ impl HyperliquidRawHttpClient {
                 _ => Ok(parsed_response),
             }
         } else if response.status.as_u16() == 429 {
-            let ra = self.parse_retry_after_simple(&response.headers);
+            let ra = Self::retry_after_ms(&response.headers);
             Err(Error::rate_limit("exchange", w, ra))
         } else {
             let error_body = String::from_utf8_lossy(&response.body);
@@ -846,10 +875,11 @@ impl HyperliquidRawHttpClient {
         }
     }
 
-    /// Submit a single order to the Hyperliquid exchange.
+    /// Returns the current rate-limit state for the info endpoint route.
     pub async fn rest_limiter_snapshot(&self) -> RateLimitSnapshot {
-        self.rest_limiter.snapshot().await
+        self.info_limiter.snapshot().await
     }
+
     async fn http_roundtrip_exchange<T>(
         &self,
         request: &HyperliquidExchangeRequest<T>,
@@ -1708,7 +1738,7 @@ impl HyperliquidHttpClient {
         mapping
     }
 
-    /// Get perpetuals metadata (internal helper).
+    /// Gets perpetuals metadata for internal use.
     #[allow(dead_code)]
     pub(crate) async fn load_perp_meta(&self) -> Result<PerpMeta> {
         self.inner.load_perp_meta().await
@@ -1720,13 +1750,13 @@ impl HyperliquidHttpClient {
         self.inner.load_all_perp_metas().await
     }
 
-    /// Get spot metadata (internal helper).
+    /// Gets spot metadata for internal use.
     #[allow(dead_code)]
     pub(crate) async fn get_spot_meta(&self) -> Result<SpotMeta> {
         self.inner.get_spot_meta().await
     }
 
-    /// Get outcome metadata (internal helper).
+    /// Gets outcome metadata for internal use.
     pub(crate) async fn get_outcome_meta(&self) -> Result<OutcomeMeta> {
         self.inner.get_outcome_meta().await
     }
@@ -3700,7 +3730,7 @@ fn perp_dex_asset_index_base(dex_index: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, sync::Arc};
+    use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
     use axum::{
         Router,
@@ -3722,7 +3752,9 @@ mod tests {
     use serde_json::{Value, json};
     use ustr::Ustr;
 
-    use super::{HyperliquidHttpClient, resolve_perp_dex_name};
+    use super::{
+        HyperliquidHttpClient, HyperliquidRawHttpClient, RETRY_AFTER_HEADER, resolve_perp_dex_name,
+    };
     use crate::{
         common::{
             consts::{HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS},
@@ -3736,6 +3768,28 @@ mod tests {
 
     const TEST_PRIVATE_KEY: &str =
         "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+    #[rstest]
+    fn raw_clients_share_rest_limit_for_one_route() {
+        let mut first =
+            HyperliquidRawHttpClient::new(HyperliquidEnvironment::Testnet, 60, None).unwrap();
+        let mut second =
+            HyperliquidRawHttpClient::new(HyperliquidEnvironment::Testnet, 60, None).unwrap();
+        first.set_base_info_url("https://shared-http-limit.test/info".to_string());
+        second.set_base_exchange_url("https://shared-http-limit.test/exchange".to_string());
+
+        assert!(Arc::ptr_eq(&first.info_limiter, &second.exchange_limiter));
+    }
+
+    #[rstest]
+    fn retry_after_ms_parses_integer_seconds() {
+        let headers = HashMap::from([(RETRY_AFTER_HEADER.to_string(), "3".to_string())]);
+
+        assert_eq!(
+            HyperliquidRawHttpClient::retry_after_ms(&headers),
+            Some(3_000)
+        );
+    }
 
     fn perp_meta_with_assets(names: &[&str]) -> PerpMeta {
         PerpMeta {

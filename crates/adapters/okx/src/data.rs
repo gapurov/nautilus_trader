@@ -33,16 +33,16 @@ use nautilus_common::{
     messages::{
         DataEvent,
         data::{
-            BarsResponse, BookResponse, DataResponse, ForwardPricesResponse, FundingRatesResponse,
-            InstrumentResponse, InstrumentsResponse, RequestBars, RequestBookSnapshot,
-            RequestForwardPrices, RequestFundingRates, RequestInstrument, RequestInstruments,
-            RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeFundingRates,
-            SubscribeIndexPrices, SubscribeInstrument, SubscribeInstrumentStatus,
-            SubscribeInstruments, SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes,
-            SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
-            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
-            UnsubscribeInstrumentStatus, UnsubscribeMarkPrices, UnsubscribeOptionGreeks,
-            UnsubscribeQuotes, UnsubscribeTrades,
+            BarsResponse, BookResponse, DataResponse, FundingRatesResponse, InstrumentResponse,
+            InstrumentsResponse, OptionChainReferencePriceResponse, RequestBars,
+            RequestBookSnapshot, RequestFundingRates, RequestInstrument, RequestInstruments,
+            RequestOptionChainReferencePrice, RequestTrades, SubscribeBars, SubscribeBookDeltas,
+            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+            SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
+            SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, TradesResponse,
+            UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeFundingRates,
+            UnsubscribeIndexPrices, UnsubscribeInstrument, UnsubscribeInstrumentStatus,
+            UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -137,19 +137,35 @@ impl OKXDataClient {
     pub fn new(client_id: ClientId, config: OKXDataClientConfig) -> anyhow::Result<Self> {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
+        let api_key = config
+            .api_key
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
+        let api_secret = config
+            .api_secret
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
+        let api_passphrase = config
+            .api_passphrase
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
+        let proxy_url = config
+            .proxy_url
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
 
         let http_client = if config.has_api_credentials() {
             OKXHttpClient::with_credentials(
-                config.api_key.clone(),
-                config.api_secret.clone(),
-                config.api_passphrase.clone(),
+                api_key,
+                api_secret,
+                api_passphrase,
                 Some(config.http_base_url()),
                 config.http_timeout_secs,
                 config.max_retries,
                 config.retry_delay_initial_ms,
                 config.retry_delay_max_ms,
                 config.environment,
-                config.proxy_url.clone(),
+                proxy_url.clone(),
             )?
         } else {
             OKXHttpClient::new(
@@ -159,7 +175,7 @@ impl OKXDataClient {
                 config.retry_delay_initial_ms,
                 config.retry_delay_max_ms,
                 config.environment,
-                config.proxy_url.clone(),
+                proxy_url.clone(),
             )?
         };
 
@@ -172,7 +188,7 @@ impl OKXDataClient {
             Some(OKX_WS_HEARTBEAT_SECS),
             None,
             config.transport_backend,
-            config.proxy_url.clone(),
+            proxy_url.clone(),
         )
         .context("failed to construct OKX public websocket client")?
         .with_socket_control(SocketControl::new(
@@ -191,7 +207,7 @@ impl OKXDataClient {
                 Some(OKX_WS_HEARTBEAT_SECS),
                 None,
                 config.transport_backend,
-                config.proxy_url.clone(),
+                proxy_url,
             )
             .context("failed to construct OKX business websocket client")?
             .with_socket_control(SocketControl::new(
@@ -1238,7 +1254,7 @@ fn dispatch_parsed_data(
             }
         }
         NautilusWsMessage::Deltas(deltas) => {
-            let data = Data::Deltas(Box::new(deltas));
+            let data = Data::BookDeltas(Box::new(deltas));
             if let Err(e) = data_sender.send(DataEvent::Data(data)) {
                 log::error!("Failed to emit data event: {e}");
             }
@@ -2778,52 +2794,45 @@ impl DataClient for OKXDataClient {
         Ok(())
     }
 
-    fn request_forward_prices(&self, request: RequestForwardPrices) -> anyhow::Result<()> {
+    fn request_option_chain_reference_price(
+        &self,
+        request: RequestOptionChainReferencePrice,
+    ) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
-        let underlying = request.underlying.to_string();
+        let series_id = request.series_id;
         let instrument_id = request.instrument_id;
         let request_id = request.request_id;
         let client_id = request.client_id.unwrap_or(self.client_id);
         let params = request.params;
         let clock = self.clock;
-        let venue = *OKX_VENUE;
 
         self.spawn_task(async move {
-            match http
-                .request_forward_prices(&underlying, instrument_id)
+            let price = match http
+                .request_option_chain_reference_price(instrument_id)
                 .await
-                .context("failed to request forward prices from OKX")
+                .context("failed to request option-chain reference price from OKX")
             {
-                Ok(forward_prices) => {
-                    let response = DataResponse::ForwardPrices(ForwardPricesResponse::new(
-                        request_id,
-                        client_id,
-                        venue,
-                        forward_prices,
-                        clock.get_time_ns(),
-                        params,
-                    ));
-
-                    if let Err(e) = sender.send(DataEvent::Response(response)) {
-                        log::error!("Failed to send forward prices response: {e}");
-                    }
-                }
+                Ok(price) => price,
                 Err(e) => {
-                    log::error!("Forward prices request failed for {underlying}: {e:?}");
-                    let response = DataResponse::ForwardPrices(ForwardPricesResponse::new(
-                        request_id,
-                        client_id,
-                        venue,
-                        Vec::new(),
-                        clock.get_time_ns(),
-                        params,
-                    ));
-
-                    if let Err(e) = sender.send(DataEvent::Response(response)) {
-                        log::error!("Failed to send forward prices response: {e}");
-                    }
+                    log::error!(
+                        "Option-chain reference price request failed for {series_id}: {e:?}"
+                    );
+                    None
                 }
+            };
+            let response =
+                DataResponse::OptionChainReferencePrice(OptionChainReferencePriceResponse::new(
+                    request_id,
+                    client_id,
+                    series_id,
+                    price,
+                    clock.get_time_ns(),
+                    params,
+                ));
+
+            if let Err(e) = sender.send(DataEvent::Response(response)) {
+                log::error!("Failed to send option-chain reference price response: {e}");
             }
         });
 

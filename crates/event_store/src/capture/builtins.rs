@@ -39,8 +39,8 @@ use nautilus_common::{
     messages::{
         data::{
             BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
-            DataCommand, DataResponse, ForwardPricesResponse, FundingRatesResponse,
-            InstrumentResponse, InstrumentsResponse, QuotesResponse, TradesResponse,
+            DataCommand, DataResponse, FundingRatesResponse, InstrumentResponse,
+            InstrumentsResponse, OptionChainReferencePriceResponse, QuotesResponse, TradesResponse,
         },
         execution::{
             BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecutionReport,
@@ -185,8 +185,9 @@ pub const PAYLOAD_TYPE_QUOTES_RESPONSE: &str = "QuotesResponse";
 pub const PAYLOAD_TYPE_TRADES_RESPONSE: &str = "TradesResponse";
 /// The canonical `payload_type` tag for [`FundingRatesResponse`].
 pub const PAYLOAD_TYPE_FUNDING_RATES_RESPONSE: &str = "FundingRatesResponse";
-/// The canonical `payload_type` tag for [`ForwardPricesResponse`].
-pub const PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE: &str = "ForwardPricesResponse";
+/// The canonical `payload_type` tag for [`OptionChainReferencePriceResponse`].
+pub const PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE: &str =
+    "OptionChainReferencePriceResponse";
 /// The canonical `payload_type` tag for [`BarsResponse`].
 pub const PAYLOAD_TYPE_BARS_RESPONSE: &str = "BarsResponse";
 
@@ -263,7 +264,7 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_QUOTES_RESPONSE,
     PAYLOAD_TYPE_TRADES_RESPONSE,
     PAYLOAD_TYPE_FUNDING_RATES_RESPONSE,
-    PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE,
+    PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE,
     PAYLOAD_TYPE_BARS_RESPONSE,
 ];
 
@@ -1347,7 +1348,9 @@ pub fn encode_data_response(response: &DataResponse) -> Result<EncodedPayload, E
         DataResponse::Quotes(resp) => encode_quotes_response(resp),
         DataResponse::Trades(resp) => encode_trades_response(resp),
         DataResponse::FundingRates(resp) => encode_funding_rates_response(resp),
-        DataResponse::ForwardPrices(resp) => encode_forward_prices_response(resp),
+        DataResponse::OptionChainReferencePrice(resp) => {
+            encode_option_chain_reference_price_response(resp)
+        }
         DataResponse::Bars(resp) => encode_bars_response(resp),
     }
 }
@@ -1491,12 +1494,12 @@ fn encode_funding_rates_response(
     ))
 }
 
-fn encode_forward_prices_response(
-    response: &ForwardPricesResponse,
+fn encode_option_chain_reference_price_response(
+    response: &OptionChainReferencePriceResponse,
 ) -> Result<EncodedPayload, EncodeError> {
     let payload = encode_serde(response)?;
     Ok(EncodedPayload::with_payload_type(
-        payload_type(PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE),
+        payload_type(PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE),
         payload,
         Vec::new(),
     ))
@@ -1538,8 +1541,8 @@ mod tests {
             },
         },
         identifiers::{
-            AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId,
-            TradeId, TraderId, Venue, VenueOrderId,
+            AccountId, ClientId, ClientOrderId, InstrumentId, OptionSeriesId, OrderListId,
+            PositionId, StrategyId, TradeId, TraderId, Venue, VenueOrderId,
         },
         instruments::{InstrumentAny, stubs::currency_pair_ethusdt},
         orderbook::OrderBook,
@@ -1549,6 +1552,7 @@ mod tests {
     };
     use rstest::rstest;
     use serde::Deserialize;
+    use ustr::Ustr;
 
     use super::*;
 
@@ -3521,12 +3525,17 @@ mod tests {
         )
     }
 
-    fn make_forward_prices_response() -> ForwardPricesResponse {
-        ForwardPricesResponse::new(
+    fn make_option_chain_reference_price_response() -> OptionChainReferencePriceResponse {
+        OptionChainReferencePriceResponse::new(
             correlation_id(),
             client_id(),
-            venue(),
-            Vec::new(),
+            OptionSeriesId::new(
+                venue(),
+                Ustr::from("BTC"),
+                Ustr::from("BTC"),
+                UnixNanos::from(100),
+            ),
+            Some(Price::from("50123.45")),
             UnixNanos::from(209),
             None,
         )
@@ -3741,9 +3750,9 @@ mod tests {
         DataResponse::FundingRates(make_funding_rates_response()),
         PAYLOAD_TYPE_FUNDING_RATES_RESPONSE
     )]
-    #[case::forward_prices(
-        DataResponse::ForwardPrices(make_forward_prices_response()),
-        PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE
+    #[case::option_chain_reference_price(
+        DataResponse::OptionChainReferencePrice(make_option_chain_reference_price_response()),
+        PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE
     )]
     #[case::bars(DataResponse::Bars(make_bars_response()), PAYLOAD_TYPE_BARS_RESPONSE)]
     fn data_response_envelope_stamps_inner_tag_for_every_variant(
@@ -3859,7 +3868,7 @@ mod tests {
     ) {
         // The TradingCommand envelope dispatch must route every variant to the matching
         // per-type extractor and forward both correlation_id and causation_id intact.
-        // A swap of args inside any extract_*_headers helper or a misrouted wrapper arm
+        // A swap of args inside any extract_*_headers function or a misrouted wrapper arm
         // is caught by exercising each variant with distinct populated values.
         let (envelope, corr, caus) = builder();
         let registry = default_registry();
@@ -3962,7 +3971,7 @@ mod tests {
     #[case::quotes(data_response_quotes())]
     #[case::trades(data_response_trades())]
     #[case::funding_rates(data_response_funding_rates())]
-    #[case::forward_prices(data_response_forward_prices())]
+    #[case::option_chain_reference_price(data_response_option_chain_reference_price())]
     #[case::bars(data_response_bars())]
     fn data_response_extractor_surfaces_correlation_id_for_every_variant(
         #[case] envelope_with_expected: (DataResponse, UUID4),
@@ -4034,10 +4043,10 @@ mod tests {
         (DataResponse::FundingRates(resp), expected)
     }
 
-    fn data_response_forward_prices() -> (DataResponse, UUID4) {
-        let resp = make_forward_prices_response();
+    fn data_response_option_chain_reference_price() -> (DataResponse, UUID4) {
+        let resp = make_option_chain_reference_price_response();
         let expected = resp.correlation_id;
-        (DataResponse::ForwardPrices(resp), expected)
+        (DataResponse::OptionChainReferencePrice(resp), expected)
     }
 
     fn data_response_bars() -> (DataResponse, UUID4) {

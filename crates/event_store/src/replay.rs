@@ -54,11 +54,11 @@ use crate::capture::builtins::{
     PAYLOAD_TYPE_BOOK_DELTAS_RESPONSE, PAYLOAD_TYPE_BOOK_DEPTH_RESPONSE,
     PAYLOAD_TYPE_BOOK_RESPONSE, PAYLOAD_TYPE_CANCEL_ALL_ORDERS, PAYLOAD_TYPE_CANCEL_ORDER,
     PAYLOAD_TYPE_CUSTOM_DATA_RESPONSE, PAYLOAD_TYPE_EXECUTION_MASS_STATUS,
-    PAYLOAD_TYPE_FILL_REPORT, PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE, PAYLOAD_TYPE_MODIFY_ORDER,
-    PAYLOAD_TYPE_ORDER_STATUS_REPORT, PAYLOAD_TYPE_ORDER_WITH_FILLS,
-    PAYLOAD_TYPE_POSITION_STATUS_REPORT, PAYLOAD_TYPE_QUERY_ACCOUNT, PAYLOAD_TYPE_QUERY_ORDER,
-    PAYLOAD_TYPE_REQUEST_COMMAND, PAYLOAD_TYPE_SUBMIT_ORDER, PAYLOAD_TYPE_SUBSCRIBE_COMMAND,
-    PAYLOAD_TYPE_TIME_EVENT, PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND,
+    PAYLOAD_TYPE_FILL_REPORT, PAYLOAD_TYPE_MODIFY_ORDER,
+    PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE, PAYLOAD_TYPE_ORDER_STATUS_REPORT,
+    PAYLOAD_TYPE_ORDER_WITH_FILLS, PAYLOAD_TYPE_POSITION_STATUS_REPORT, PAYLOAD_TYPE_QUERY_ACCOUNT,
+    PAYLOAD_TYPE_QUERY_ORDER, PAYLOAD_TYPE_REQUEST_COMMAND, PAYLOAD_TYPE_SUBMIT_ORDER,
+    PAYLOAD_TYPE_SUBSCRIBE_COMMAND, PAYLOAD_TYPE_TIME_EVENT, PAYLOAD_TYPE_UNSUBSCRIBE_COMMAND,
 };
 #[cfg(all(test, feature = "defi"))]
 use crate::capture::builtins::{
@@ -177,7 +177,7 @@ pub(crate) const FORENSIC_ONLY_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_BOOK_RESPONSE,
     PAYLOAD_TYPE_BOOK_DELTAS_RESPONSE,
     PAYLOAD_TYPE_BOOK_DEPTH_RESPONSE,
-    PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE,
+    PAYLOAD_TYPE_OPTION_CHAIN_REFERENCE_PRICE_RESPONSE,
 ];
 
 /// Inclusive event-store `seq` bounds for replay input scans.
@@ -2264,6 +2264,18 @@ mod tests {
 
     const CACHE_MUTATION_COVERAGE: &[CacheMutationCoverage] = &[
         cache_mutation(
+            // Startup configuration is reapplied during strategy registration, but runtime claim
+            // changes are not captured or persisted for recovery.
+            "set_external_order_claims",
+            CacheMutationRecoveryClass::MissingLiveRecovery,
+            &[],
+        ),
+        cache_mutation(
+            "register_external_order_claims",
+            CacheMutationRecoveryClass::MissingLiveRecovery,
+            &[],
+        ),
+        cache_mutation(
             "set_database",
             CacheMutationRecoveryClass::SnapshotOwned,
             &[],
@@ -2391,6 +2403,11 @@ mod tests {
         cache_mutation(
             "add_instrument_status",
             CacheMutationRecoveryClass::MissingLiveRecovery,
+            &[],
+        ),
+        cache_mutation(
+            "add_instrument_close",
+            CacheMutationRecoveryClass::SnapshotOwned,
             &[],
         ),
         cache_mutation(
@@ -3295,6 +3312,17 @@ mod tests {
                 "forensic-only payload type must be ignored by cache replay: {payload_type}",
             );
         }
+    }
+
+    #[rstest]
+    fn legacy_forward_prices_response_is_ignored_by_cache_replay() {
+        let entry = append_payload(1, "ForwardPricesResponse", Bytes::from_static(&[0xc1])).entry;
+        let mut cache = Cache::default();
+
+        let applied = apply_cache_replay_entry(&mut cache, &entry)
+            .expect("legacy forensic payload must not be decoded by cache replay");
+
+        assert!(!applied);
     }
 
     #[rstest]

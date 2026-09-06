@@ -62,7 +62,7 @@ A run starts when the kernel starts and ends when the process stops cleanly or c
 Streamed market-data observations stay in the data catalog. The event store records the command
 stream, raw reports, generated events, and metadata needed to replay how the engine reacted to that
 world. Data responses are the exception: every response to an engine request is captured, including
-book, forward-price, and custom-data responses. Only some of them, listed under
+book, option-chain reference price, and custom-data responses. Only some of them, listed under
 [Cache replay](#cache-replay), carry a rule that applies them back to cache state; the rest are
 inspection records.
 

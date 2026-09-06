@@ -17,6 +17,14 @@
 //!
 //! The adapter emits provider JSON only as UW-specific custom data. It never acts as a venue,
 //! instrument provider, execution client, or native market-data authority.
+//!
+//! # Feature Flags
+//!
+//! - `arrow`: Enables Arrow serialization for custom data.
+//! - `examples`: Enables the live node support used by examples.
+//! - `extension-module`: Builds Python extension bindings and enables `python`.
+//! - `high-precision`: Uses high-precision model values. Enabled by default.
+//! - `python`: Enables Python bindings.
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]

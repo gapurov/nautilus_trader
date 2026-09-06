@@ -174,7 +174,7 @@ impl UnusualWhalesHttpClient {
         let operation_id = request.operation.operation_id;
         let result = self
             .retry_manager
-            .execute_with_retry_with_delay(
+            .invocation(
                 operation_id,
                 || {
                     let attempts = Arc::clone(&attempts);
@@ -182,9 +182,10 @@ impl UnusualWhalesHttpClient {
                     async move { self.attempt(&request, &attempts).await }
                 },
                 |failure| failure.retryable,
-                |failure| failure.retry_after,
                 control_failure,
             )
+            .retry_delay(&|failure| failure.retry_after)
+            .execute()
             .await;
         let payload = match result {
             Ok(payload) => payload,
@@ -232,9 +233,9 @@ impl UnusualWhalesHttpClient {
             tokio::select! {
                 response = &mut response => break response,
                 () = &mut renewal => {
-                    if let Err(error) = lease.renew().await {
+                    if let Err(e) = lease.renew().await {
                         let _ = lease.release().await;
-                        return Err(coordination_failure(error));
+                        return Err(coordination_failure(e));
                     }
                 }
             }
@@ -358,12 +359,10 @@ fn response_observation(response: &HttpResponse, received_at_ms: i64) -> Respons
                 .retry_after
                 .as_deref()
                 .and_then(|value| retry_after_until_ms(value, received_at_ms))
-                .or_else(|| {
-                    if provider_rate_limited {
-                        requests_per_minute_reset_ms
-                    } else {
-                        None
-                    }
+                .or(if provider_rate_limited {
+                    requests_per_minute_reset_ms
+                } else {
+                    None
                 })
                 .or_else(|| provider_rate_limited.then(|| received_at_ms.saturating_add(60_000)))
         },
@@ -579,10 +578,23 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(AtomicU32::new(0));
         let server_requests = Arc::clone(&requests);
+
         let handle = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 4096];
-            stream.read(&mut request).await.unwrap();
+            let mut received = 0;
+            while !request[..received]
+                .windows(4)
+                .any(|bytes| bytes == b"\r\n\r\n")
+            {
+                assert!(
+                    received < request.len(),
+                    "request headers exceed test buffer"
+                );
+                let count = stream.read(&mut request[received..]).await.unwrap();
+                assert!(count > 0, "connection closed before request headers");
+                received += count;
+            }
             server_requests.fetch_add(1, Ordering::Relaxed);
             let response = concat!(
                 "HTTP/1.1 200 OK\r\n",

@@ -30,16 +30,16 @@ use nautilus_common::{
         DataEvent,
         data::{
             CustomDataResponse, DataResponse, RequestBars, RequestBookDeltas, RequestBookDepth,
-            RequestBookSnapshot, RequestCustomData, RequestForwardPrices, RequestFundingRates,
-            RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeBookDepth10, SubscribeCustomData, SubscribeFundingRates,
-            SubscribeIndexPrices, SubscribeInstrument, SubscribeInstrumentClose,
-            SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
-            SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, UnsubscribeBars,
-            UnsubscribeBookDeltas, UnsubscribeBookDepth10, UnsubscribeCustomData,
-            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
-            UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeInstruments,
-            UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
+            RequestBookSnapshot, RequestCustomData, RequestFundingRates, RequestInstrument,
+            RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars, SubscribeBookDeltas,
+            SubscribeBookDepth10, SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices,
+            SubscribeInstrument, SubscribeInstrumentClose, SubscribeInstrumentStatus,
+            SubscribeInstruments, SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes,
+            SubscribeTrades, UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth10,
+            UnsubscribeCustomData, UnsubscribeFundingRates, UnsubscribeIndexPrices,
+            UnsubscribeInstrument, UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus,
+            UnsubscribeInstruments, UnsubscribeMarkPrices, UnsubscribeOptionGreeks,
+            UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
@@ -222,7 +222,7 @@ impl UnusualWhalesDataClient {
             })
     }
 
-    fn shutdown_now(&mut self) {
+    fn shutdown_now(&self) {
         self.cancellation.cancel();
         self.tasks.abort_all();
 
@@ -426,7 +426,6 @@ impl DataClient for UnusualWhalesDataClient {
     reject_request!(request_quotes, RequestQuotes);
     reject_request!(request_trades, RequestTrades);
     reject_request!(request_funding_rates, RequestFundingRates);
-    reject_request!(request_forward_prices, RequestForwardPrices);
     reject_request!(request_bars, RequestBars);
     reject_request!(request_book_depth, RequestBookDepth);
     reject_request!(request_book_deltas, RequestBookDeltas);

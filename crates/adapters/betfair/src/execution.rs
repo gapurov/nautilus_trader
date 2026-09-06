@@ -83,7 +83,7 @@ use nautilus_core::{
 };
 use nautilus_live::{
     ExecutionClientCore, ExecutionEventEmitter, SocketControl,
-    execution::failure::CommandFailure,
+    execution::{failure::CommandFailure, reports::retain_order_status_reports},
     task::{TaskGroup, TaskGroupGuard},
 };
 use nautilus_model::{
@@ -230,6 +230,17 @@ impl BetfairExecutionClient {
     #[must_use]
     pub fn is_reconciling(&self) -> bool {
         self.reconciliation_gate.is_halted()
+    }
+
+    /// Waits for the reconciliation halt state to equal `expected`.
+    ///
+    /// Returns immediately if the gate is already in the expected state; otherwise
+    /// waits for a later transition. A transient expected state that is replaced
+    /// before this task observes it can be missed because transitions are not
+    /// recorded as history. This method has no internal timeout; callers wanting a
+    /// bound should wrap it in [`tokio::time::timeout`].
+    pub async fn wait_for_reconciliation_state(&self, expected: bool) {
+        wait_for_reconciliation_state(&self.reconciliation_gate, expected).await;
     }
 
     fn submissions_halted(&self) -> bool {
@@ -1977,7 +1988,7 @@ impl ExecutionClient for BetfairExecutionClient {
                 self.core.account_id,
                 self.clock.get_time_ns(),
                 market_ids.clone(),
-                false,
+                None,
                 &self.ocm_state,
                 Some(&self.emitter),
                 stream_session,
@@ -1990,6 +2001,7 @@ impl ExecutionClient for BetfairExecutionClient {
                 self.clock.get_time_ns(),
                 market_ids,
                 date_range,
+                None,
                 &self.ocm_state,
                 stream_session,
                 &mut fill_refresh,
@@ -2042,7 +2054,7 @@ impl ExecutionClient for BetfairExecutionClient {
             self.core.account_id,
             self.clock.get_time_ns(),
             self.reconcile_market_ids(),
-            cmd.open_only,
+            Some(cmd),
             &self.ocm_state,
             Some(&self.emitter),
             stream_session,
@@ -2086,6 +2098,7 @@ impl ExecutionClient for BetfairExecutionClient {
             self.clock.get_time_ns(),
             self.reconcile_market_ids(),
             date_range,
+            Some(&cmd),
             &self.ocm_state,
             stream_session,
             &mut session_refresh,
@@ -2109,6 +2122,11 @@ impl ExecutionClient for BetfairExecutionClient {
         self.process_pending_resync();
 
         let order = self.core.get_order(&cmd.client_order_id)?;
+
+        if let Err(reason) = validate_order(&order) {
+            self.emitter.emit_order_denied(&order, &reason.to_string());
+            return Ok(());
+        }
 
         if self.submissions_halted() {
             log::warn!(
@@ -2955,6 +2973,18 @@ impl ExecutionClient for BetfairExecutionClient {
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
         self.process_pending_resync();
 
+        let orders = self.core.get_orders_for_list(&cmd.order_list)?;
+
+        if let Some(reason) = orders.iter().find_map(|order| validate_order(order).err()) {
+            let reason = reason.to_string();
+
+            for order in &orders {
+                self.emitter.emit_order_denied(order, &reason);
+            }
+
+            return Ok(());
+        }
+
         if self.submissions_halted() {
             log::warn!(
                 "Halting submit_order_list ({} orders) while the execution stream is \
@@ -2978,16 +3008,14 @@ impl ExecutionClient for BetfairExecutionClient {
 
         let mut candidates = Vec::new();
 
-        for client_order_id in &cmd.order_list.client_order_ids {
-            let order = self.core.get_order(client_order_id)?;
-
+        for order in orders {
             if order.is_closed() {
-                log::warn!("Skipping closed order {client_order_id}");
+                log::warn!("Skipping closed order {}", order.client_order_id());
                 continue;
             }
 
             let instruction = create_place_instruction(&order, selection_id, handicap)?;
-            candidates.push((instruction, order.clone()));
+            candidates.push((instruction, order));
         }
 
         let mut instructions = Vec::new();
@@ -3302,6 +3330,21 @@ impl BetfairExecutionClient {
 
             Ok(())
         });
+    }
+}
+
+fn validate_order(order: &impl Order) -> Result<(), OrderDeniedReason> {
+    if order.is_reduce_only() {
+        return Err(OrderDeniedReason::UnsupportedReduceOnly);
+    }
+
+    match order.order_type() {
+        OrderType::Limit => Ok(()),
+        OrderType::Market if order.time_in_force() != TimeInForce::AtTheClose => Err(
+            OrderDeniedReason::UnsupportedTimeInForce(order.time_in_force()),
+        ),
+        OrderType::Market => Ok(()),
+        order_type => Err(OrderDeniedReason::UnsupportedOrderType { order_type }),
     }
 }
 
@@ -3684,7 +3727,7 @@ async fn fetch_order_status_reports_http(
     account_id: AccountId,
     ts_init: UnixNanos,
     market_ids: Option<Vec<String>>,
-    open_only: bool,
+    filter: Option<&GenerateOrderStatusReports>,
     ocm_state: &Arc<Mutex<OcmState>>,
     emitter: Option<&ExecutionEventEmitter>,
     stream_session: StreamSession<'_>,
@@ -3695,12 +3738,22 @@ async fn fetch_order_status_reports_http(
         account_id,
         ts_init,
         market_ids,
-        open_only,
+        filter.is_some_and(|filter| filter.open_only),
         ocm_state,
         stream_session,
         session_refresh,
     )
     .await?;
+
+    if let Some(filter) = filter {
+        fetched.reports.retain(|report| {
+            filter
+                .instrument_id
+                .is_none_or(|instrument_id| report.instrument_id == instrument_id)
+        });
+
+        retain_order_status_reports(&mut fetched.reports, filter);
+    }
 
     if let Some(emitter) = emitter {
         resolve_pending_modifies(
@@ -4050,11 +4103,12 @@ async fn fetch_fill_reports_http(
     ts_init: UnixNanos,
     market_ids: Option<Vec<String>>,
     date_range: Option<TimeRange>,
+    filter: Option<&GenerateFillReports>,
     ocm_state: &Arc<Mutex<OcmState>>,
     stream_session: StreamSession<'_>,
     session_refresh: &mut SessionRefresh,
 ) -> anyhow::Result<Vec<FillReport>> {
-    let orders = fetch_fill_orders_http(
+    let mut orders = fetch_fill_orders_http(
         http_client,
         market_ids,
         date_range,
@@ -4062,6 +4116,19 @@ async fn fetch_fill_reports_http(
         session_refresh,
     )
     .await?;
+
+    if let Some(filter) = filter {
+        orders.retain(|order| {
+            filter
+                .venue_order_id
+                .is_none_or(|venue_order_id| venue_order_id.as_str() == order.bet_id)
+                && filter.instrument_id.is_none_or(|instrument_id| {
+                    make_instrument_id(&order.market_id, order.selection_id, order.handicap)
+                        == instrument_id
+                })
+        });
+    }
+
     let mut state = ocm_state.lock();
     let customer_order_refs = state.customer_order_refs.clone();
     let mut fill_tracker = state.fill_tracker.clone();
@@ -4252,6 +4319,21 @@ async fn wait_for_generation_change(
     generation: u64,
 ) {
     while *state_rx.borrow_and_update() == generation {
+        if state_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Waits until the gate's halt state equals `expected`.
+///
+/// Subscribes before the first read so a transition landing between the two is
+/// observed rather than missed. The generation channel is used only as an edge
+/// notification; `is_halted` remains the authoritative read.
+async fn wait_for_reconciliation_state(gate: &ReconciliationGate, expected: bool) {
+    let mut state_rx = gate.subscribe();
+
+    while gate.is_halted() != expected {
         if state_rx.changed().await.is_err() {
             return;
         }
@@ -4564,7 +4646,7 @@ impl StreamSession<'_> {
 
         let _ = http_client
             .with_session_token(|token| {
-                client.update_auth(self.app_key, token.to_string());
+                client.update_auth(self.app_key, token.clone());
             })
             .await;
     }
@@ -4585,7 +4667,7 @@ async fn apply_stream_session_refresh(
 
     let _ = http_client
         .with_session_token(|token| {
-            stream_client.update_auth(app_key, token.to_string());
+            stream_client.update_auth(app_key, token.clone());
             if session_refresh.replaced {
                 let _ = stream_client.request_reconnect();
             }
@@ -4924,6 +5006,75 @@ mod tests {
         http::models::{AccountDetailsResponse, CancelInstructionReport},
         stream::messages::stream_decode,
     };
+
+    fn validation_order_builder(order_type: OrderType) -> OrderTestBuilder {
+        let mut order = OrderTestBuilder::new(order_type);
+        order
+            .instrument_id(InstrumentId::from("1.234567-12345-0.0.BETFAIR"))
+            .quantity(Quantity::from(10));
+
+        match order_type {
+            OrderType::Limit => {
+                order.price(Price::from("2.0"));
+            }
+            OrderType::StopMarket => {
+                order.trigger_price(Price::from("2.0"));
+            }
+            _ => {}
+        }
+
+        order
+    }
+
+    #[rstest]
+    #[case(OrderType::Limit, TimeInForce::Gtc)]
+    #[case(OrderType::Market, TimeInForce::AtTheClose)]
+    fn test_validate_order_accepts_supported_orders(
+        #[case] order_type: OrderType,
+        #[case] time_in_force: TimeInForce,
+    ) {
+        let order = validation_order_builder(order_type)
+            .time_in_force(time_in_force)
+            .build();
+
+        assert_eq!(validate_order(&order), Ok(()));
+    }
+
+    #[rstest]
+    fn test_validate_order_denies_reduce_only() {
+        let order = validation_order_builder(OrderType::Limit)
+            .reduce_only(true)
+            .build();
+
+        assert_eq!(
+            validate_order(&order),
+            Err(OrderDeniedReason::UnsupportedReduceOnly),
+        );
+    }
+
+    #[rstest]
+    fn test_validate_order_denies_unsupported_order_type() {
+        let order = validation_order_builder(OrderType::StopMarket).build();
+
+        assert_eq!(
+            validate_order(&order),
+            Err(OrderDeniedReason::UnsupportedOrderType {
+                order_type: OrderType::StopMarket,
+            }),
+        );
+    }
+
+    #[rstest]
+    fn test_validate_order_denies_unsupported_market_time_in_force() {
+        let order = validation_order_builder(OrderType::Market)
+            .time_in_force(TimeInForce::Gtc)
+            .build();
+
+        assert_eq!(
+            validate_order(&order),
+            Err(OrderDeniedReason::UnsupportedTimeInForce(TimeInForce::Gtc)),
+        );
+    }
 
     #[rstest]
     #[case(

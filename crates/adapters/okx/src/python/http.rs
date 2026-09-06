@@ -13,14 +13,14 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Python bindings exposing OKX HTTP helper functions and data conversions.
+//! Python bindings for OKX HTTP methods and data conversions.
 
 use jiff::Timestamp;
 use nautilus_core::python::{
     IntoPyObjectNautilusExt, params::value_to_pyobject, to_pyruntime_err, to_pyvalue_err,
 };
 use nautilus_model::{
-    data::{BarType, forward::ForwardPrice},
+    data::BarType,
     enums::{OrderSide, OrderType, PositionSide, TimeInForce, TriggerType},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
@@ -663,38 +663,6 @@ impl OKXHttpClient {
                     .map(|rate| rate.into_py_any(py))
                     .collect::<PyResult<Vec<_>>>()?;
                 let pylist = PyList::new(py, py_rates)?;
-                Ok(pylist.into_py_any_unwrap(py))
-            })
-        })
-    }
-
-    /// Requests forward prices for OKX options using the option summary endpoint.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP request fails or no usable instrument family can be resolved.
-    #[pyo3(name = "request_forward_prices")]
-    #[pyo3(signature = (underlying, instrument_id=None))]
-    fn py_request_forward_prices<'py>(
-        &self,
-        py: Python<'py>,
-        underlying: String,
-        instrument_id: Option<InstrumentId>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let forward_prices: Vec<ForwardPrice> = client
-                .request_forward_prices(&underlying, instrument_id)
-                .await
-                .map_err(to_pyvalue_err)?;
-
-            Python::attach(|py| {
-                let py_prices = forward_prices
-                    .into_iter()
-                    .map(|price| price.into_py_any(py))
-                    .collect::<PyResult<Vec<_>>>()?;
-                let pylist = PyList::new(py, py_prices)?;
                 Ok(pylist.into_py_any_unwrap(py))
             })
         })
@@ -1577,8 +1545,22 @@ impl From<OKXHttpError> for PyErr {
             // Runtime/operational errors
             OKXHttpError::Canceled(msg) => to_pyruntime_err(format!("Request canceled: {msg}")),
             OKXHttpError::HttpClientError(e) => to_pyruntime_err(format!("Network error: {e}")),
+            OKXHttpError::RetryableStatus { status, body, .. } => {
+                to_pyruntime_err(format!("Temporary HTTP status code {status}: {body}"))
+            }
             OKXHttpError::UnexpectedStatus { status, body } => {
                 to_pyruntime_err(format!("Unexpected HTTP status code {status}: {body}"))
+            }
+            OKXHttpError::RetryableOkxError {
+                error_code,
+                message,
+                ..
+            } => to_pyruntime_err(format!("Temporary OKX error {error_code}: {message}")),
+            OKXHttpError::MalformedResponse(msg) => {
+                to_pyruntime_err(format!("Malformed response: {msg}"))
+            }
+            OKXHttpError::ResponseDecoding(msg) => {
+                to_pyruntime_err(format!("Response decoding error: {msg}"))
             }
             OKXHttpError::OperationTimeout { timeout_ms } => {
                 to_pyruntime_err(format!("Operation timed out after {timeout_ms}ms"))
@@ -1594,7 +1576,9 @@ impl From<OKXHttpError> for PyErr {
             OKXHttpError::ValidationError(msg) => {
                 to_pyvalue_err(format!("Parameter validation error: {msg}"))
             }
-            OKXHttpError::JsonError(msg) => to_pyvalue_err(format!("JSON error: {msg}")),
+            OKXHttpError::RequestSerialization(msg) => {
+                to_pyvalue_err(format!("Request serialization error: {msg}"))
+            }
             OKXHttpError::OkxError {
                 error_code,
                 message,

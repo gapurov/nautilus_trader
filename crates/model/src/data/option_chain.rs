@@ -637,6 +637,24 @@ mod tests {
     }
 
     #[rstest]
+    fn test_strike_range_resolve_fixed_intersects_available_strikes() {
+        let range = StrikeRange::Fixed(vec![
+            Price::from("50000"),
+            Price::from("55000"),
+            Price::from("60000"),
+        ]);
+        let available = [
+            Price::from("45000"),
+            Price::from("50000"),
+            Price::from("60000"),
+        ];
+
+        let result = range.resolve(None, &available);
+
+        assert_eq!(result, vec![Price::from("50000"), Price::from("60000")]);
+    }
+
+    #[rstest]
     fn test_strike_range_resolve_atm_relative() {
         let range = StrikeRange::AtmRelative {
             strikes_above: 2,
@@ -652,6 +670,29 @@ mod tests {
         assert_eq!(result.len(), 5);
         assert_eq!(result[0], Price::from("45000"));
         assert_eq!(result[4], Price::from("55000"));
+    }
+
+    #[rstest]
+    #[case("49750", "50000")]
+    #[case("50250", "50000")]
+    #[case("51750", "52000")]
+    fn test_strike_range_resolve_atm_relative_selects_nearest_strike(
+        #[case] atm: &str,
+        #[case] expected: &str,
+    ) {
+        let range = StrikeRange::AtmRelative {
+            strikes_above: 0,
+            strikes_below: 0,
+        };
+        let strikes = [
+            Price::from("48000"),
+            Price::from("50000"),
+            Price::from("52000"),
+        ];
+
+        let result = range.resolve(Some(Price::from(atm)), &strikes);
+
+        assert_eq!(result, vec![Price::from(expected)]);
     }
 
     #[rstest]

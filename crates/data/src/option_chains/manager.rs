@@ -37,7 +37,7 @@ use nautilus_core::{UUID4, correctness::FAILED, datetime::millis_to_nanos_unchec
 use nautilus_model::{
     data::{QuoteTick, option_chain::OptionGreeks},
     enums::OptionKind,
-    identifiers::{InstrumentId, OptionSeriesId, Venue},
+    identifiers::{ClientId, InstrumentId, OptionSeriesId, Venue},
     instruments::Instrument,
     types::Price,
 };
@@ -71,6 +71,7 @@ pub struct OptionChainManager {
     deferred_cmd_queue: DeferredCommandQueue,
     /// Clock reference for constructing command timestamps.
     clock: Rc<RefCell<dyn Clock>>,
+    client_id: Option<ClientId>,
     /// When `true`, every quote/greeks update for an active instrument immediately publishes a snapshot.
     raw_mode: bool,
 }
@@ -95,6 +96,7 @@ impl OptionChainManager {
     ) -> Rc<RefCell<Self>> {
         let topic = switchboard::get_option_chain_topic(series_id);
         let instruments = Self::resolve_instruments(cache, &series_id);
+        let client_id = client.as_ref().map(|client| client.client_id);
 
         let mut tracker = AtmTracker::new();
 
@@ -129,6 +131,7 @@ impl OptionChainManager {
             bootstrapped,
             deferred_cmd_queue,
             clock: clock.clone(),
+            client_id,
             raw_mode,
         };
         let manager_rc = Rc::new(RefCell::new(manager));
@@ -334,6 +337,16 @@ impl OptionChainManager {
         self.bootstrapped
     }
 
+    #[must_use]
+    pub(crate) fn is_instrument_active(&self, instrument_id: &InstrumentId) -> bool {
+        self.aggregator.active_ids().contains(instrument_id)
+    }
+
+    #[must_use]
+    pub(crate) const fn client_id(&self) -> Option<ClientId> {
+        self.client_id
+    }
+
     /// Tears down this manager: unregisters all msgbus handlers and cancels the timer.
     pub fn teardown(&mut self, clock: &Rc<RefCell<dyn Clock>>) {
         // Unsubscribe from all currently active instruments
@@ -369,7 +382,7 @@ impl OptionChainManager {
 
     /// Routes incoming greeks to the aggregator.
     ///
-    /// Also updates the ATM tracker from the forward price if `ForwardPrice` source is active,
+    /// Also updates the ATM tracker from the reference price when one is available,
     /// and triggers deferred bootstrap on the first arrival.
     pub fn handle_greeks(&mut self, greeks: &OptionGreeks) {
         if self.aggregator.is_expired(greeks.ts_event) {
@@ -562,7 +575,7 @@ impl OptionChainManager {
         queue.push_back(DeferredCommand::Subscribe(SubscribeCommand::Quotes(
             SubscribeQuotes {
                 instrument_id,
-                client_id: None,
+                client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
                 ts_init,
@@ -573,7 +586,7 @@ impl OptionChainManager {
         queue.push_back(DeferredCommand::Subscribe(SubscribeCommand::OptionGreeks(
             SubscribeOptionGreeks {
                 instrument_id,
-                client_id: None,
+                client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
                 ts_init,
@@ -584,7 +597,7 @@ impl OptionChainManager {
         queue.push_back(DeferredCommand::Subscribe(
             SubscribeCommand::InstrumentStatus(SubscribeInstrumentStatus {
                 instrument_id,
-                client_id: None,
+                client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
                 ts_init,
@@ -602,7 +615,7 @@ impl OptionChainManager {
         queue.push_back(DeferredCommand::Unsubscribe(UnsubscribeCommand::Quotes(
             UnsubscribeQuotes {
                 instrument_id,
-                client_id: None,
+                client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
                 ts_init,
@@ -613,7 +626,7 @@ impl OptionChainManager {
         queue.push_back(DeferredCommand::Unsubscribe(
             UnsubscribeCommand::OptionGreeks(UnsubscribeOptionGreeks {
                 instrument_id,
-                client_id: None,
+                client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
                 ts_init,
@@ -624,7 +637,7 @@ impl OptionChainManager {
         queue.push_back(DeferredCommand::Unsubscribe(
             UnsubscribeCommand::InstrumentStatus(UnsubscribeInstrumentStatus {
                 instrument_id,
-                client_id: None,
+                client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
                 ts_init,
@@ -858,6 +871,7 @@ mod tests {
             bootstrapped: true,
             deferred_cmd_queue: queue.clone(),
             clock,
+            client_id: None,
             raw_mode: false,
         };
         (manager, queue)
@@ -934,6 +948,7 @@ mod tests {
             bootstrapped: false,
             deferred_cmd_queue: queue.clone(),
             clock,
+            client_id: None,
             raw_mode: false,
         };
         (manager, queue)
@@ -1205,6 +1220,7 @@ mod tests {
             bootstrapped: true,
             deferred_cmd_queue: queue,
             clock,
+            client_id: None,
             raw_mode: false,
         };
 

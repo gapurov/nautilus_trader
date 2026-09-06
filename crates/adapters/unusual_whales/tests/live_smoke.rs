@@ -129,18 +129,17 @@ async fn controlled_account_rest_and_websocket_smoke() {
                 .data
                 .as_any()
                 .downcast_ref::<UnusualWhalesWebSocketEvent>()
+                && frame.channel == "price:AAPL"
             {
-                if frame.channel == "price:AAPL" {
-                    let payload = serde_json::from_str::<Value>(&frame.frame_json)
-                        .expect("WebSocket event should contain valid JSON");
-                    let is_acknowledgement = payload
-                        .as_array()
-                        .and_then(|parts| parts.get(1))
-                        .and_then(Value::as_object)
-                        .is_some_and(|value| value.contains_key("status"));
-                    if !is_acknowledgement {
-                        websocket_payload = Some(payload);
-                    }
+                let payload = serde_json::from_str::<Value>(&frame.frame_json)
+                    .expect("WebSocket event should contain valid JSON");
+                let is_acknowledgement = payload
+                    .as_array()
+                    .and_then(|parts| parts.get(1))
+                    .and_then(Value::as_object)
+                    .is_some_and(|value| value.contains_key("status"));
+                if !is_acknowledgement {
+                    websocket_payload = Some(payload);
                 }
             }
 

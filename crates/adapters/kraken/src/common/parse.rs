@@ -13,9 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Conversion helpers that translate Kraken API schemas into Nautilus domain models.
+//! Converters that translate Kraken API schemas into Nautilus domain models.
 
-use std::str::FromStr;
+use std::{fmt::Display, str::FromStr};
 
 use anyhow::Context;
 use nautilus_core::{datetime::NANOSECONDS_IN_MILLISECOND, nanos::UnixNanos, uuid::UUID4};
@@ -185,6 +185,16 @@ pub fn parse_spot_instrument(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
+    parse_spot_instrument_with_fee_rates(pair_name, definition, None, ts_event, ts_init)
+}
+
+pub(crate) fn parse_spot_instrument_with_fee_rates(
+    pair_name: &str,
+    definition: &AssetPairInfo,
+    fee_rates: Option<(Decimal, Decimal)>,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<InstrumentAny> {
     let symbol_str = definition.wsname.as_ref().unwrap_or(&definition.altname);
     let normalized_symbol = normalize_spot_symbol(symbol_str);
     let instrument_id = InstrumentId::new(Symbol::new(&normalized_symbol), *KRAKEN_VENUE);
@@ -214,13 +224,7 @@ pub fn parse_spot_instrument(
         .map(|s| parse_quantity(s, "ordermin"))
         .transpose()?;
 
-    // Use base tier fees, convert from percentage
-    let taker_fee = definition.fees.first().map(|(_, fee)| *fee / dec!(100));
-
-    let maker_fee = definition
-        .fees_maker
-        .first()
-        .map(|(_, fee)| *fee / dec!(100));
+    let (maker_fee, taker_fee) = resolve_fee_rates(definition, fee_rates);
 
     let instrument = CurrencyPair::builder()
         .instrument_id(instrument_id)
@@ -256,6 +260,16 @@ pub fn parse_tokenized_instrument(
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<InstrumentAny> {
+    parse_tokenized_instrument_with_fee_rates(pair_name, definition, None, ts_event, ts_init)
+}
+
+pub(crate) fn parse_tokenized_instrument_with_fee_rates(
+    pair_name: &str,
+    definition: &AssetPairInfo,
+    fee_rates: Option<(Decimal, Decimal)>,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<InstrumentAny> {
     let symbol_str = definition.wsname.as_ref().unwrap_or(&definition.altname);
     let normalized_symbol = normalize_spot_symbol(symbol_str);
     let instrument_id = InstrumentId::new(Symbol::new(&normalized_symbol), *KRAKEN_VENUE);
@@ -284,12 +298,7 @@ pub fn parse_tokenized_instrument(
         .map(|s| parse_quantity(s, "ordermin"))
         .transpose()?;
 
-    let taker_fee = definition.fees.first().map(|(_, fee)| *fee / dec!(100));
-
-    let maker_fee = definition
-        .fees_maker
-        .first()
-        .map(|(_, fee)| *fee / dec!(100));
+    let (maker_fee, taker_fee) = resolve_fee_rates(definition, fee_rates);
 
     let instrument = TokenizedAsset::builder()
         .instrument_id(instrument_id)
@@ -312,6 +321,24 @@ pub fn parse_tokenized_instrument(
     Ok(InstrumentAny::TokenizedAsset(instrument))
 }
 
+fn resolve_fee_rates(
+    definition: &AssetPairInfo,
+    account_fee_rates: Option<(Decimal, Decimal)>,
+) -> (Option<Decimal>, Option<Decimal>) {
+    account_fee_rates.map_or_else(
+        || {
+            (
+                definition
+                    .fees_maker
+                    .first()
+                    .map(|(_, fee)| *fee / dec!(100)),
+                definition.fees.first().map(|(_, fee)| *fee / dec!(100)),
+            )
+        },
+        |(maker, taker)| (Some(maker), Some(taker)),
+    )
+}
+
 /// Parses a Kraken futures instrument definition into a Nautilus crypto perpetual instrument.
 ///
 /// # Errors
@@ -319,7 +346,12 @@ pub fn parse_tokenized_instrument(
 /// Returns an error if:
 /// - Tick size cannot be parsed as a valid price.
 /// - Contract size cannot be parsed as a valid quantity.
+/// - Tick size, contract value trade precision, or contract size exceeds the active fixed
+///   precision.
 /// - Currency codes are invalid.
+///
+/// In standard-precision builds, an unsupported-precision error identifies the instrument,
+/// required precision, supported maximum, and the `high-precision` rebuild action.
 pub fn parse_futures_instrument(
     instrument: &FuturesInstrument,
     ts_event: UnixNanos,
@@ -340,14 +372,9 @@ pub fn parse_futures_instrument(
 
     // Normalize before deriving precision so wire padding does not overstate the tick precision
     let tick_size = instrument.tick_size.normalize();
-    let price_precision = u8::try_from(tick_size.scale()).context("Invalid tick_size precision")?;
-    if price_precision > FIXED_PRECISION {
-        anyhow::bail!(
-            "Cannot parse instrument '{}': tick_size {tick_size} requires precision {price_precision} \
-             which exceeds FIXED_PRECISION ({FIXED_PRECISION})",
-            instrument.symbol
-        );
-    }
+    let price_precision = tick_size.scale();
+    check_futures_precision(&instrument.symbol, "tick_size", tick_size, price_precision)?;
+    let price_precision = u8::try_from(price_precision).context("Invalid tick_size precision")?;
     let price_increment = Price::from_decimal_dp(tick_size, price_precision)?;
 
     // Use contract_value_trade_precision for the tradeable size increment
@@ -355,8 +382,16 @@ pub fn parse_futures_instrument(
     // Negative values (e.g., -3) mean multiples of powers of 10 (1000) - used for meme coins
     // Zero means whole number increments (1)
     let size_increment = if instrument.contract_value_trade_precision >= 0 {
-        let precision = u8::try_from(instrument.contract_value_trade_precision)
+        let precision = u32::try_from(instrument.contract_value_trade_precision)
             .context("Invalid contract_value_trade_precision")?;
+        check_futures_precision(
+            &instrument.symbol,
+            "contract_value_trade_precision",
+            instrument.contract_value_trade_precision,
+            precision,
+        )?;
+        let precision =
+            u8::try_from(precision).context("Invalid contract_value_trade_precision")?;
         Quantity::from_decimal_dp(
             Decimal::try_new(1, u32::from(precision))
                 .context("Invalid contract_value_trade_precision")?,
@@ -372,8 +407,15 @@ pub fn parse_futures_instrument(
     };
 
     let contract_size = instrument.contract_size.normalize();
+    let multiplier_precision = contract_size.scale();
+    check_futures_precision(
+        &instrument.symbol,
+        "contract_size",
+        contract_size,
+        multiplier_precision,
+    )?;
     let multiplier_precision =
-        u8::try_from(contract_size.scale()).context("Invalid contract_size precision")?;
+        u8::try_from(multiplier_precision).context("Invalid contract_size precision")?;
     let multiplier = Some(Quantity::from_decimal_dp(
         contract_size,
         multiplier_precision,
@@ -407,6 +449,30 @@ pub fn parse_futures_instrument(
         .unwrap();
 
     Ok(InstrumentAny::CryptoPerpetual(instrument))
+}
+
+fn check_futures_precision(
+    symbol: &str,
+    field: &str,
+    value: impl Display,
+    precision: u32,
+) -> anyhow::Result<()> {
+    if precision <= u32::from(FIXED_PRECISION) {
+        return Ok(());
+    }
+
+    #[cfg(feature = "high-precision")]
+    anyhow::bail!(
+        "Cannot parse Kraken Futures instrument '{symbol}': {field} {value} requires precision \
+         {precision}, but this build supports at most {FIXED_PRECISION}"
+    );
+
+    #[cfg(not(feature = "high-precision"))]
+    anyhow::bail!(
+        "Cannot parse Kraken Futures instrument '{symbol}': {field} {value} requires precision \
+         {precision}, but this build supports at most {FIXED_PRECISION}; enable the \
+         'high-precision' Cargo feature and rebuild"
+    );
 }
 
 fn parse_price(value: &str, field: &str) -> anyhow::Result<Price> {
@@ -1262,6 +1328,31 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_spot_instrument_with_account_fee_rates() {
+        let json = load_test_json("http_asset_pairs.json");
+        let response: KrakenResponse<AssetPairsResponse> = serde_json::from_str(&json).unwrap();
+        let pairs = response.result.unwrap();
+        let (pair_name, definition) = pairs.iter().next().unwrap();
+
+        let instrument = parse_spot_instrument_with_fee_rates(
+            pair_name,
+            definition,
+            Some((dec!(0.0017), dec!(0.0029))),
+            TS,
+            TS,
+        )
+        .unwrap();
+
+        match instrument {
+            InstrumentAny::CurrencyPair(pair) => {
+                assert_eq!(pair.maker_fee, dec!(0.0017));
+                assert_eq!(pair.taker_fee, dec!(0.0029));
+            }
+            _ => panic!("Expected CurrencyPair"),
+        }
+    }
+
+    #[rstest]
     fn test_parse_futures_instrument_inverse() {
         let json = load_test_json("http_futures_instruments.json");
         let response: crate::http::models::FuturesInstrumentsResponse =
@@ -1319,8 +1410,27 @@ mod tests {
         }
     }
 
-    // PF_PEPEUSD has tickSize: 1e-10 which requires precision 10
-    // This test requires high-precision mode (FIXED_PRECISION=16) which is the default build
+    #[rstest]
+    fn test_parse_futures_instrument_accepts_max_precision() {
+        let json = load_test_json("http_futures_instruments.json");
+        let response: crate::http::models::FuturesInstrumentsResponse =
+            serde_json::from_str(&json).unwrap();
+        let mut fut_instrument = response.instruments[1].clone();
+        let tick_size = Decimal::try_new(1, u32::from(FIXED_PRECISION)).unwrap();
+        fut_instrument.tick_size = tick_size;
+
+        let instrument = parse_futures_instrument(&fut_instrument, TS, TS).unwrap();
+
+        match instrument {
+            InstrumentAny::CryptoPerpetual(perp) => {
+                assert_eq!(perp.price_precision(), FIXED_PRECISION);
+                assert_eq!(perp.price_increment.as_decimal(), tick_size);
+            }
+            _ => panic!("Expected CryptoPerpetual"),
+        }
+    }
+
+    #[cfg(feature = "high-precision")]
     #[rstest]
     fn test_parse_futures_instrument_negative_precision() {
         let json = load_test_json("http_futures_instruments.json");
@@ -1342,6 +1452,63 @@ mod tests {
             }
             _ => panic!("Expected CryptoPerpetual"),
         }
+    }
+
+    #[cfg(feature = "high-precision")]
+    #[rstest]
+    fn test_parse_futures_instrument_rejects_precision_above_high_max() {
+        let json = load_test_json("http_futures_instruments.json");
+        let response: crate::http::models::FuturesInstrumentsResponse =
+            serde_json::from_str(&json).unwrap();
+        let mut fut_instrument = response.instruments[1].clone();
+        fut_instrument.tick_size = dec!(0.00000000000000001);
+
+        let error = parse_futures_instrument(&fut_instrument, TS, TS).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Cannot parse Kraken Futures instrument 'PF_ETHUSD': tick_size \
+             0.00000000000000001 requires precision 17, but this build supports at most 16"
+        );
+    }
+
+    #[cfg(not(feature = "high-precision"))]
+    #[rstest]
+    fn test_parse_futures_instrument_rejects_unsupported_precision() {
+        let json = load_test_json("http_futures_instruments.json");
+        let response: crate::http::models::FuturesInstrumentsResponse =
+            serde_json::from_str(&json).unwrap();
+
+        let tick_error = parse_futures_instrument(&response.instruments[2], TS, TS).unwrap_err();
+
+        let mut trade_precision_instrument = response.instruments[1].clone();
+        trade_precision_instrument.contract_value_trade_precision = 256;
+        let trade_precision_error =
+            parse_futures_instrument(&trade_precision_instrument, TS, TS).unwrap_err();
+
+        let mut contract_size_instrument = response.instruments[1].clone();
+        contract_size_instrument.contract_size = dec!(0.0000000001);
+        let contract_size_error =
+            parse_futures_instrument(&contract_size_instrument, TS, TS).unwrap_err();
+
+        assert_eq!(
+            tick_error.to_string(),
+            "Cannot parse Kraken Futures instrument 'PF_PEPEUSD': tick_size 0.0000000001 requires \
+             precision 10, but this build supports at most 9; enable the 'high-precision' Cargo \
+             feature and rebuild"
+        );
+        assert_eq!(
+            trade_precision_error.to_string(),
+            "Cannot parse Kraken Futures instrument 'PF_ETHUSD': contract_value_trade_precision 256 \
+             requires precision 256, but this build supports at most 9; enable the 'high-precision' \
+             Cargo feature and rebuild"
+        );
+        assert_eq!(
+            contract_size_error.to_string(),
+            "Cannot parse Kraken Futures instrument 'PF_ETHUSD': contract_size 0.0000000001 requires \
+             precision 10, but this build supports at most 9; enable the 'high-precision' Cargo \
+             feature and rebuild"
+        );
     }
 
     #[rstest]
@@ -2083,6 +2250,31 @@ mod tests {
                 assert!(ta.min_quantity.is_some());
                 assert_eq!(ta.maker_fee, dec!(-0.0002));
                 assert_eq!(ta.taker_fee, dec!(0.001));
+            }
+            _ => panic!("Expected TokenizedAsset, received {instrument:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_parse_tokenized_instrument_with_account_fee_rates() {
+        let json = load_test_json("http_asset_pairs_tokenized.json");
+        let response: KrakenResponse<AssetPairsResponse> = serde_json::from_str(&json).unwrap();
+        let pairs = response.result.unwrap();
+        let (pair_name, definition) = pairs.iter().next().unwrap();
+
+        let instrument = parse_tokenized_instrument_with_fee_rates(
+            pair_name,
+            definition,
+            Some((dec!(0.0003), dec!(0.0019))),
+            TS,
+            TS,
+        )
+        .unwrap();
+
+        match instrument {
+            InstrumentAny::TokenizedAsset(asset) => {
+                assert_eq!(asset.maker_fee, dec!(0.0003));
+                assert_eq!(asset.taker_fee, dec!(0.0019));
             }
             _ => panic!("Expected TokenizedAsset, received {instrument:?}"),
         }

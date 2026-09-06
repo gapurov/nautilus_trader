@@ -838,7 +838,8 @@ DataTesterConfig::builder()
 
 - Option chain subscriptions are managed by the DataEngine, which creates per-instrument
   quote and greeks subscriptions internally.
-- ATM-relative strike ranges require a forward price bootstrap before subscriptions begin.
+- Dynamic strike ranges require an ATM price before instrument subscriptions begin. The
+  DataEngine requests an initial reference price and otherwise waits for live option Greeks.
 - Not yet configurable via `DataTesterConfig`; requires manual actor setup with
   `subscribe_option_chain` and an `OptionSeriesId`.
 

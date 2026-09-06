@@ -223,9 +223,10 @@ We recommend using environment variables to manage your credentials.
 
 ## Data capability
 
-Polymarket supports live `L2_MBP` order book deltas, quotes, and trades. Instrument definitions are
-published by bootstrap, configured refreshes, on-demand loading, single-instrument requests,
-new-market discovery, and tick-size changes.
+Polymarket supports live `L2_MBP` order book deltas, quotes, trades, and resolution
+`InstrumentStatus`/`InstrumentClose` events. Instrument definitions are published by bootstrap,
+configured refreshes, on-demand loading, single-instrument requests, new-market discovery, and
+tick-size changes.
 
 ## Orders capability
 
@@ -243,7 +244,7 @@ gives each client time to shut down cleanly.
 | Order Type             | Binary Options | Notes                                                                     |
 | ---------------------- | -------------- | ------------------------------------------------------------------------- |
 | `MARKET`               | ✓              | **BUY orders require quote quantity**, SELL orders require base quantity. |
-| `LIMIT`                | ✓              |                                                                           |
+| `LIMIT`                | ✓              | BUY orders accept base or quote quantity; SELL orders require base.       |
 | `STOP_MARKET`          | -              | *Not supported by Polymarket*.                                            |
 | `STOP_LIMIT`           | -              | *Not supported by Polymarket*.                                            |
 | `MARKET_IF_TOUCHED`    | -              | *Not supported by Polymarket*.                                            |
@@ -252,19 +253,45 @@ gives each client time to shut down cleanly.
 
 ### Quantity semantics
 
-Polymarket interprets order quantities differently depending on the order type *and* side:
+Polymarket interprets order quantities differently depending on the order type, side, and
+`quote_quantity` setting:
 
-- **Limit** orders interpret `quantity` as the number of conditional tokens (base units).
-- **Market SELL** orders also use base-unit quantities.
+- **Limit orders with `quote_quantity=False`** interpret `quantity` as the number of conditional
+  tokens (base units).
+- **Limit BUY orders with `quote_quantity=True`** interpret `quantity` as pUSD collateral:
+  - The adapter truncates collateral to cents, signs it as the maker amount, and derives shares at
+    the market's amount precision.
+  - It updates the local order to the signed share quantity before processing the venue response.
+  - The signed amounts must preserve the limit price exactly. Otherwise, the adapter rejects the
+    order before HTTP. For example, 10.00 pUSD at 0.33 is not representable, while 9.90 pUSD at
+    0.33 produces exactly 30 shares.
 - **Market BUY** orders interpret `quantity` as quote notional in **pUSD**.
+- **Market SELL** orders use base-unit quantities.
 
-As a result, a market buy order submitted with a base-denominated quantity will execute far
-more size than intended.
+Quote-sized limit SELL orders are not supported. The adapter denies them before submission. It also
+denies any limit order whose base or quote quantity truncates to zero at the two-decimal signing
+boundary.
+
+To cap a limit BUY by collateral, set `quote_quantity=True`:
+
+```python
+# Limit BUY with quote quantity (spend $10 pUSD at a limit price of 0.50)
+order = strategy.order_factory.limit(
+    instrument_id=instrument_id,
+    order_side=OrderSide.BUY,
+    quantity=instrument.make_qty(10.0),
+    price=instrument.make_price(0.50),
+    time_in_force=TimeInForce.GTC,
+    quote_quantity=True,
+)
+strategy.submit_order(order)
+```
 
 When submitting market BUY orders, set `quote_quantity=True` on the order. The adapter converts
 the quote amount (pUSD) to the signed base-unit share amount before posting to the CLOB. The
 Polymarket execution client denies base-denominated market buys to
-prevent unintended fills.
+prevent unintended fills. A market BUY submitted with a base-denominated quantity can execute far
+more size than intended.
 
 ```python
 # Market BUY with quote quantity (spend $10 pUSD)
@@ -309,7 +336,7 @@ resting `LIMIT` orders only.
 Read each market's `min_order_size` from its order book; active markets commonly report five
 shares. Marketable orders can also be rejected below **1 pUSD** in notional value with
 `invalid amount for a marketable BUY order … min size: $1`. The adapter leaves instrument
-`min_quantity` unset because market BUY quantities use pUSD while the other order quantities use
+`min_quantity` unset because quote-sized BUY quantities use pUSD while base-sized orders use
 shares.
 :::
 
@@ -321,11 +348,25 @@ as an `OrderCanceled` event, not `OrderExpired`.
 
 ### Advanced order features
 
-| Feature            | Binary Options | Notes                            |
-| ------------------ | -------------- | -------------------------------- |
-| Order modification | -              | Cancellation functionality only. |
-| Bracket/OCO orders | -              | *Not supported by Polymarket.*   |
-| Iceberg orders     | -              | *Not supported by Polymarket.*   |
+| Feature            | Binary Options | Notes                                                   |
+| ------------------ | -------------- | ------------------------------------------------------- |
+| Order modification | Yes            | Adapter-managed cancel-replace for open `LIMIT` orders. |
+| Bracket/OCO orders | -              | *Not supported by Polymarket.*                          |
+| Iceberg orders     | -              | *Not supported by Polymarket.*                          |
+
+Polymarket has no in-place modify endpoint. The execution client cancels the current venue order,
+reconciles its final confirmed fills, and signs a replacement for the remaining quantity. The
+`ModifyOrder.quantity` value is the absolute target for the logical order, not the replacement leg.
+The replacement keeps the `ClientOrderId` and receives a new `VenueOrderId`. The resulting logical
+quantity reflects the exact signed base quantity after venue precision normalization, so it can be
+slightly lower than the requested target.
+
+The adapter submits no replacement unless the cancel response, canceled order state, and confirmed
+trade totals agree. An ambiguous cancel emits `OrderModifyRejected`. An ambiguous replacement stays
+in flight under its deterministic signed order hash so a later order update, fill, or order
+reconciliation can establish the replacement without emitting a second `OrderAccepted`. Later
+modify and cancel commands remain blocked until that happens. This recovery state is not persisted
+across an execution-client process restart.
 
 ### Batch operations
 
@@ -344,8 +385,8 @@ sequential 15-order chunks.
 - Only `LIMIT` orders are batched. `MARKET` orders inside the list are routed to the
   single-order path, which signs a marketable order and submits it with `FAK` or `FOK`
   based on Nautilus `time_in_force`.
-- `reduce_only` orders, `quote_quantity` orders, and `post_only` with market TIF
-  (`IOC` or `FOK`) are rejected before submission.
+- `reduce_only` orders, quote-sized SELL orders, and `post_only` with market TIF (`IOC` or `FOK`)
+  are denied before submission.
 - A single eligible order falls through to `POST /order` so it keeps the single-order retry
   semantics; the batch path deliberately disables retry because the venue does not expose an
   idempotency key.
@@ -420,7 +461,8 @@ A `delayed` response:
 
 #### Definitive and ambiguous outcomes
 
-Polymarket applies the shared [command outcome policy](../concepts/execution.md#command-outcomes) and
+Polymarket applies the shared
+[command outcome policy](../concepts/execution/policies.md#command-outcomes) and
 the adapter guide's
 [diagnostic and strategy reason boundary](../developer_guide/adapters.md#separate-diagnostics-from-strategy-facing-reasons)
 at its execution boundary.
@@ -545,12 +587,15 @@ precision requirements**:
   - A limit order submitted with `FAK` or `FOK` must also satisfy the stricter market-order amount
     validation. The venue rejects values that are valid for a resting order but not for that
     market-order type.
-  - For a limit BUY, `quantity` is the nominal share quantity at the limit price. With `FAK` or
-    `FOK`, Polymarket spends the resulting pUSD maker budget, so price improvement can return more
-    shares; the adapter updates the order quantity to the actual fill.
-  - The adapter denies the order before signing when `quantity * price` is not an exact cent amount.
-    It does not round and recompute the nominal share quantity because that would change the signed
-    price/amount ratio.
+  - For a base-sized limit BUY, `quantity` is the nominal share quantity at the limit price. With
+    `FAK` or `FOK`, Polymarket spends the resulting pUSD maker budget, so price improvement can
+    return more shares; the adapter updates the order quantity to the actual fill.
+  - The adapter denies a base-sized limit BUY before signing when `quantity * price` is not an exact
+    cent amount. It does not round and recompute the nominal share quantity because that would
+    change the signed price/amount ratio.
+  - For a collateral-sized limit BUY, the adapter truncates the direct maker amount to cents. The
+    computed share amount uses the market tick decimals plus two size decimals. The signed integer
+    amounts must preserve the requested limit price exactly after this quantization.
 
 - **Resting limit order types (`GTC` and `GTD`):** More flexible precision based on
   market tick size.
@@ -568,14 +613,17 @@ precision requirements**:
 
 :::note
 
-- The adapter validates tick size before signing. It also denies limit `FAK` or `FOK` BUYs whose
-  maker amount has more than two decimal places. This applies to single and batch submissions.
+- The adapter validates tick size before signing. It also denies base-sized limit `FAK` or `FOK`
+  BUYs whose maker amount has more than two decimal places. This applies to single and batch
+  submissions.
 - The adapter requires instrument tick sizes to be exactly representable at four decimals. It
   rejects instrument definitions and tick-size events that do not meet this requirement; a rejected
   event leaves the current tick active.
 - Tick decimals control signing and amount precision. They do not change the instrument's canonical
   four-decimal price precision.
-- Resting `GTC` and `GTD` limit orders and all SELL orders keep their tick-derived amount precision.
+- Base-sized resting `GTC` and `GTD` limit orders and all SELL orders keep their tick-derived amount
+  precision. Collateral-sized limit BUYs use cents for the direct maker amount and tick-derived
+  precision for the computed share amount.
 - The adapter rejects limit prices outside the current market's `tick_size` to `1 - tick_size`
   range before signing.
 - The published `BinaryOption` advertises `min_price` and `max_price` equal to `tick_size` and
@@ -833,8 +881,9 @@ in `nautilus_polymarket::common::consts`.
 
 The user channel reports `original_size` on an `order` message as the signed `makerAmount`. For a
 market order type (`FAK` or `FOK`) BUY that amount is the pUSD budget rather than a share count, so
-a BUY of 100 shares at 0.01 reports `1`. The adapter divides by the order price to recover the
-submitted share quantity before the size reaches the fill tracker or an order status report.
+a BUY of 100 shares at 0.01 reports `1`. The adapter divides by the order price when it must express
+that venue amount as shares in an order status report. Locally submitted quote-sized limit BUYs use
+the share quantity derived during signing as their authoritative fill-tracker quantity.
 
 A SELL signs shares as its maker amount and needs no conversion. Resting types (`GTC` and `GTD`)
 pass through unchanged: their denomination is unconfirmed, and converting a share-denominated size
@@ -1009,8 +1058,9 @@ the full universe at startup is rarely practical. The data adapter auto-loads mi
 demand so that strategies can subscribe to markets that are not in the cache:
 
 - When a strategy issues `subscribe_quotes`, `subscribe_trades`, `subscribe_book_deltas`,
-  or `request_instrument` for an instrument that is not cached, the adapter registers the request and
-  waits `auto_load_debounce_ms` (default 100 ms) so that concurrent requests coalesce.
+  `subscribe_instrument_status`, `subscribe_instrument_close`, or `request_instrument` for an
+  instrument that is not cached, the adapter registers the request and waits
+  `auto_load_debounce_ms` (default 100 ms) so that concurrent requests coalesce.
 - It then issues a single batched Gamma API call. Batches larger than the Gamma `condition_ids`
   query ceiling (about 100) are split across multiple calls and merged.
 - Once the instruments are loaded, they are published to the data engine (populating the cache)
@@ -1050,9 +1100,41 @@ caller must resubscribe after the market becomes available.
 
 The Rust data client tracks Polymarket exposure at `condition_id` level so both YES and NO legs
 close together when the venue resolves the market. Position events add open Polymarket binary
-option instruments to an internal watchlist. Once a watched condition expires, the data client
-waits `resolve_poll_grace_secs`, then polls Gamma every `resolve_poll_interval_secs` until the
-condition resolves or `resolve_poll_max_wait_secs` elapses.
+option instruments to an internal watchlist. Data clients can also watch an instrument without a
+position by subscribing to `InstrumentStatus`, `InstrumentClose`, or both. These subscriptions are
+independent: a status subscription emits only the status close, while a close subscription emits
+only the settlement price. Unsubscribing from one does not remove the other.
+
+Cached instruments establish a watch when the subscription is accepted. Missing instruments first
+pass through auto-loading and the configured instrument filters. Unsubscribing removes only that
+data owner; open positions retain their independent ownership. If loading cannot produce usable
+metadata, no automatic watch is created. An accepted unresolved intent can still be checked with
+an explicit manual resolution selector.
+
+If an outcome arrives while a subscribed instrument is still loading, the client retains that
+outcome until its metadata passes the configured filters. Already admitted data and position owners
+settle immediately; a pending sibling does not delay them. Completing the pending subscription emits
+only its requested events and does not reopen ordinary market-data streams. Unsubscribing its last
+event type or rejecting its instrument filter discards the retained outcome.
+
+Once a watched condition expires, the data client waits `resolve_poll_grace_secs`, then polls Gamma
+every `resolve_poll_interval_secs` until the condition resolves or
+`resolve_poll_max_wait_secs` elapses.
+
+| Delivery path         | Configuration and eligibility                                         | Release                                                      |
+| --------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------ |
+| Auto-load outcome.    | A strict outcome in a fetched Gamma payload, regardless of polling.   | Applied immediately; the auto-load task completes.           |
+| Gamma/CLOB polling.   | `resolve_poll_enabled=true`, within the expiration-based poll window. | Resolution, last owner removal, timeout, or shutdown.        |
+| Resolution WebSocket. | `subscribe_new_markets=true`, with an active, unpaused data watch.    | Resolution, last data owner removal, timeout, or shutdown.   |
+| Manual request.       | Any configuration, using explicit selectors or the watchlist rules.   | Request completion; successful resolution removes the watch. |
+
+The shipped defaults use polling, without a resolution-only WebSocket subscription. Disabling
+polling does not enable WebSocket resolution: that path requires `subscribe_new_markets=true`.
+With both disabled, later recovery requires a manual request.
+
+These WebSocket ownership rules apply to the data subscription's token, not the independently
+configured venue-wide discovery feed. Releasing the token does not disconnect that feed. Valid
+resolutions received there still use the shared apply path for existing data and position owners.
 
 Resolution uses strict winner inference:
 
@@ -1063,14 +1145,36 @@ Resolution uses strict winner inference:
 - Non-binary, ambiguous, malformed, or still-unresolved payloads are skipped. They remain on the
   watchlist until the poll window times out or a manual request resolves them.
 
-When the client applies a resolution, it emits one `InstrumentStatus` close and one
-`InstrumentClose` per tracked leg. The winner leg closes at `1`, and the losing leg closes at `0`.
-The close type is `InstrumentCloseType.ContractExpired`. This event closes Nautilus exposure and
-does not redeem tokens or claim funds on-chain.
+Auto-loading applies a strict outcome from either its normal lookup or positive closure probe
+immediately. An expiration that is future, stale, or missing does not discard an outcome already
+obtained. Without a strict outcome, existing expiration deadlines still apply: late subscriptions
+do not receive a fresh polling window, and missing expiration does not cause indefinite polling.
 
-The same apply path handles WebSocket `market_resolved` events, automatic polling, and manual
-requests. After `resolve_poll_max_wait_secs`, automatic polling pauses the watched condition and
-logs it for manual recovery. Manual requests can still retry the condition later.
+When the client applies a resolution, position-owned legs emit one `InstrumentStatus` close and one
+`InstrumentClose`. Data-only legs emit whichever event types have active subscriptions. The winner
+leg closes at `1`, and the losing leg closes at `0`. The close type is
+`InstrumentCloseType.CONTRACT_EXPIRED`. This event closes Nautilus exposure and does not redeem
+tokens or claim funds on-chain.
+
+Gamma's positive `closed=true` evidence stops normal quote, trade, and book-delta streams for both
+outcome siblings, even when the payload cannot produce usable instruments. Closure alone does not
+establish a winner or emit settlement events. Existing resolution owners remain available for
+polling or manual recovery; an enabled, unpaused resolution WebSocket may remain until resolution
+or timeout. Later live subscriptions cannot reopen the closed condition.
+
+The same apply path handles auto-load outcomes, WebSocket `market_resolved` events, automatic
+polling, and manual requests. Successful resolution emits each admitted owner's event types once,
+removes those owners and the condition's watch, and releases its WebSocket subscriptions. Existing
+pending data intents retain their outcome until admission or cancellation; new subscriptions cannot
+re-enroll the resolved condition. Automatic delivery never bypasses instrument-filter admission.
+
+After `resolve_poll_max_wait_secs`, the watch pauses and releases resolution-only WebSocket
+ownership, including when polling is disabled. An open market's independent quote, trade, or book
+subscriptions are unaffected by this pause. The client retains settlement metadata and ownership
+for manual recovery; a manual request does not restart the automatic deadline. Disconnect stops
+network work, and reconnect resumes unfinished loading and replays cached, active resolution
+WebSocket subscriptions. Reset discards retained ownership and outcomes and requires fresh
+subscriptions.
 
 #### Manual resolution requests
 
@@ -1316,7 +1420,7 @@ Class/struct: `PolymarketDataClientConfig`.
 | `http_timeout_secs`, `ws_timeout_secs` | `60`, `30` | HTTP and WebSocket timeout in seconds.                                                    |
 | `ws_max_subscriptions`                 | `200`      | Per-connection subscription cap; the market pool shards across connections at this bound. |
 | `update_instruments_interval_mins`     | `60`       | Instrument catalogue refresh interval; pass `None` to disable it.                         |
-| `subscribe_new_markets`                | `false`    | Subscribe to new-market discovery events; also enables `best_bid_ask` quote ticks.        |
+| `subscribe_new_markets`                | `false`    | Subscribe to discovery and resolution events; also enables `best_bid_ask` quote ticks.    |
 | `new_market_filter`                    | `None`     | Rust-only filter applied to newly discovered markets before instrument emission.          |
 | `new_market_fetch_max_concurrency`     | `8`        | Bound concurrent market fetches from discovery events.                                    |
 | `drop_quotes_missing_side`             | `true`     | Drop quotes that do not contain both a bid and an ask.                                    |

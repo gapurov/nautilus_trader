@@ -57,7 +57,7 @@ use super::{
 };
 use crate::{
     common::{
-        enums::{BybitOrderSide, BybitOrderStatus, BybitProductType},
+        enums::{BybitExecType, BybitOrderSide, BybitOrderStatus, BybitProductType},
         parse::{
             bybit_rejection_due_post_only, get_currency, make_bybit_symbol, parse_millis_timestamp,
             parse_price_with_precision, parse_quantity_with_precision,
@@ -649,6 +649,16 @@ fn dispatch_execution_fill(
     account_id: AccountId,
     ts_init: UnixNanos,
 ) {
+    if exec.exec_type == BybitExecType::Funding {
+        log::debug!(
+            "Skipping funding execution: symbol={}, order_id={}, exec_id={}",
+            exec.symbol,
+            exec.order_id,
+            exec.exec_id,
+        );
+        return;
+    }
+
     if exec.exec_type.is_exchange_generated() {
         log::warn!(
             "Exchange-generated execution: exec_type={:?}, symbol={}, order_id={}, order_link_id={}, side={:?}, qty={}, price={}",
@@ -1804,6 +1814,47 @@ mod tests {
         assert!(matches!(
             event,
             ExecutionEvent::Report(ExecutionReport::Fill(_))
+        ));
+    }
+
+    #[rstest]
+    #[case::untracked("")]
+    #[case::tracked("test-order-link-001")]
+    fn test_dispatch_funding_execution_emits_no_event(#[case] order_link_id: &str) {
+        let instrument = linear_instrument();
+        let instruments = build_instruments(std::slice::from_ref(&instrument));
+        let (emitter, mut rx) = create_emitter();
+        let clock = get_atomic_clock_realtime();
+        let state = WsDispatchState::default();
+
+        let json = load_test_json("ws_account_execution_funding.json");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["data"][0]["orderLinkId"] = serde_json::Value::String(order_link_id.to_string());
+        let msg: crate::websocket::messages::BybitWsAccountExecutionMsg =
+            serde_json::from_value(value).unwrap();
+        let execution = &msg.data[0];
+
+        assert_eq!(execution.exec_type, BybitExecType::Funding);
+
+        if !execution.order_link_id.is_empty() {
+            state.order_identities.insert(
+                ClientOrderId::new(execution.order_link_id.as_str()),
+                default_identity(),
+            );
+        }
+
+        dispatch_ws_message(
+            &BybitWsMessage::AccountExecution(msg),
+            &emitter,
+            &state,
+            test_account_id(),
+            &instruments,
+            clock,
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
     }
 

@@ -7,9 +7,19 @@ data. It does not provide instruments, native market data, execution, a venue, o
 
 See the [integration guide](../../../docs/integrations/unusual_whales.md).
 
+## Feature flags
+
+- `arrow`: Enables Arrow serialization for custom data.
+- `examples`: Enables the live node support used by examples.
+- `extension-module`: Builds Python extension bindings and enables `python`.
+- `high-precision`: Uses high-precision model values. Enabled by default.
+- `python`: Enables Python bindings.
+
 ## Contract generation
 
 The repository contains the official OpenAPI source snapshot and deterministic generated output.
+Keep the source snapshot byte-for-byte: its checksum is part of the generated contract and tests.
+The whitespace and YAML format hooks exclude this file.
 Regenerate from the network only during development:
 
 ```bash

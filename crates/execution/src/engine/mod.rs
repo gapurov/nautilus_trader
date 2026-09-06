@@ -117,7 +117,6 @@ pub struct ExecutionEngine {
     default_client_id: Option<ClientId>,
     routing_map: HashMap<Venue, ClientId>,
     oms_overrides: HashMap<StrategyId, OmsType>,
-    external_order_claims: HashMap<InstrumentId, StrategyId>,
     external_clients: HashSet<ClientId>,
     pos_id_generator: PositionIdGenerator,
     config: ExecutionEngineConfig,
@@ -151,7 +150,6 @@ impl ExecutionEngine {
             default_client_id: None,
             routing_map: HashMap::new(),
             oms_overrides: HashMap::new(),
-            external_order_claims: HashMap::new(),
             external_clients: config
                 .as_ref()
                 .and_then(|c| c.external_clients.clone())
@@ -330,7 +328,11 @@ impl ExecutionEngine {
     #[must_use]
     /// Returns the set of instruments that have external order claims.
     pub fn get_external_order_claims_instruments(&self) -> HashSet<InstrumentId> {
-        self.external_order_claims.keys().copied().collect()
+        self.cache
+            .borrow()
+            .external_order_claim_instrument_ids(None)
+            .into_iter()
+            .collect()
     }
 
     #[must_use]
@@ -342,19 +344,7 @@ impl ExecutionEngine {
     #[must_use]
     /// Returns any external order claim for the given instrument ID.
     pub fn get_external_order_claim(&self, instrument_id: &InstrumentId) -> Option<StrategyId> {
-        self.external_order_claims.get(instrument_id).copied()
-    }
-
-    /// Returns the instruments with external order claims owned by `strategy_id`.
-    #[must_use]
-    pub fn get_external_order_claims_for_strategy(
-        &self,
-        strategy_id: StrategyId,
-    ) -> HashSet<InstrumentId> {
-        self.external_order_claims
-            .iter()
-            .filter_map(|(instrument_id, owner)| (*owner == strategy_id).then_some(*instrument_id))
-            .collect()
+        self.cache.borrow().external_order_claim(instrument_id)
     }
 
     /// Registers a new execution client.
@@ -597,20 +587,10 @@ impl ExecutionEngine {
         strategy_id: StrategyId,
         instrument_ids: &HashSet<InstrumentId>,
     ) -> anyhow::Result<()> {
-        // Validate all instruments first
-        for instrument_id in instrument_ids {
-            if let Some(existing) = self.external_order_claims.get(instrument_id) {
-                anyhow::bail!(
-                    "External order claim for {instrument_id} already exists for {existing}"
-                );
-            }
-        }
-
-        // If validation passed, insert all claims
-        for instrument_id in instrument_ids {
-            self.external_order_claims
-                .insert(*instrument_id, strategy_id);
-        }
+        let instrument_ids: Vec<_> = instrument_ids.iter().copied().collect();
+        self.cache
+            .borrow_mut()
+            .register_external_order_claims(strategy_id, &instrument_ids)?;
 
         if !instrument_ids.is_empty() {
             log::info!("Registered external order claims for {strategy_id}: {instrument_ids:?}");
@@ -619,39 +599,16 @@ impl ExecutionEngine {
         Ok(())
     }
 
-    /// Commits external order claims for `strategy_id` without validation.
-    ///
-    /// The caller must have preflighted every instrument against
-    /// [`Self::get_external_order_claim`]: an existing claim is overwritten
-    /// without error. Coordinated live-node callers should use
-    /// `LiveNode::register_external_order_claims`, which preflights both the
-    /// execution engine and the reconciliation manager before committing;
-    /// ordinary callers should use
-    /// [`Self::register_external_order_claims`] instead.
-    pub fn commit_external_order_claims(
-        &mut self,
-        strategy_id: StrategyId,
-        instrument_ids: &HashSet<InstrumentId>,
-    ) {
-        self.external_order_claims.extend(
-            instrument_ids
-                .iter()
-                .map(|instrument_id| (*instrument_id, strategy_id)),
-        );
-
-        if !instrument_ids.is_empty() {
-            log::info!("Registered external order claims for {strategy_id}: {instrument_ids:?}");
-        }
-    }
-
     /// Deregisters all external order claims owned by `strategy_id`.
     ///
-    /// Coordinated live-node callers should use
-    /// `LiveNode::deregister_external_order_claims` so the execution engine and
-    /// reconciliation manager remain consistent.
+    /// # Panics
+    ///
+    /// Panics if the shared cache is already borrowed.
     pub fn deregister_external_order_claims(&mut self, strategy_id: StrategyId) {
-        self.external_order_claims
-            .retain(|_, owner| *owner != strategy_id);
+        self.cache
+            .borrow_mut()
+            .set_external_order_claims(strategy_id, &[])
+            .expect("clearing external order claims cannot fail");
     }
 
     /// # Errors
@@ -1351,9 +1308,9 @@ impl ExecutionEngine {
     }
 
     fn resolve_external_strategy(&self, instrument_id: &InstrumentId) -> StrategyId {
-        self.external_order_claims
-            .get(instrument_id)
-            .copied()
+        self.cache
+            .borrow()
+            .external_order_claim(instrument_id)
             .unwrap_or_else(StrategyId::external)
     }
 
@@ -1924,7 +1881,6 @@ impl ExecutionEngine {
         self.event_count = 0;
         self.report_count = 0;
         self.filtered_unclaimed_external_order_count = 0;
-
         log::info!("Reset");
     }
 
@@ -1950,6 +1906,23 @@ impl ExecutionEngine {
 
         if self.config.debug {
             log::debug!("{RECV}{CMD} {command:?}");
+        }
+
+        match self.validate_submission(&command) {
+            SubmissionValidationResult::Valid => {}
+            SubmissionValidationResult::StaleOrder {
+                client_order_id,
+                status,
+            } => {
+                log::warn!(
+                    "Skipping stale submit command for {client_order_id} in status {status}"
+                );
+                return;
+            }
+            SubmissionValidationResult::Deny(reason) => {
+                self.deny_submission(&command, &reason);
+                return;
+            }
         }
 
         if let Some(cid) = command.client_id()
@@ -2018,6 +1991,111 @@ impl ExecutionEngine {
             TradingCommand::CancelAllOrders(cmd) => self.handle_cancel_all_orders(client, &cmd),
             TradingCommand::QueryOrder(cmd) => self.handle_query_order(client, cmd),
             TradingCommand::QueryAccount(cmd) => self.handle_query_account(client, cmd),
+        }
+    }
+
+    fn validate_submission(&self, command: &TradingCommand) -> SubmissionValidationResult {
+        match command {
+            TradingCommand::SubmitOrder(cmd) => {
+                let cache = self.cache.borrow();
+                let Some(order) = cache.order(&cmd.client_order_id) else {
+                    return SubmissionValidationResult::Valid;
+                };
+
+                if matches!(
+                    order.status(),
+                    OrderStatus::Initialized | OrderStatus::Released
+                ) {
+                    SubmissionValidationResult::Valid
+                } else {
+                    SubmissionValidationResult::StaleOrder {
+                        client_order_id: order.client_order_id(),
+                        status: order.status(),
+                    }
+                }
+            }
+            TradingCommand::SubmitOrderList(cmd) => {
+                let cache = self.cache.borrow();
+                let has_ineligible_order = cmd
+                    .order_list
+                    .client_order_ids
+                    .iter()
+                    .filter_map(|client_order_id| cache.order(client_order_id))
+                    .any(|order| {
+                        !matches!(
+                            order.status(),
+                            OrderStatus::Initialized | OrderStatus::Released
+                        )
+                    });
+
+                if !has_ineligible_order {
+                    return SubmissionValidationResult::Valid;
+                }
+
+                SubmissionValidationResult::Deny(OrderDeniedReason::OrderListDenied {
+                    order_list_id: cmd.order_list.id,
+                })
+            }
+            _ => SubmissionValidationResult::Valid,
+        }
+    }
+
+    fn deny_submission(&self, command: &TradingCommand, reason: &OrderDeniedReason) {
+        let TradingCommand::SubmitOrderList(cmd) = command else {
+            return;
+        };
+
+        let cache = self.cache.borrow();
+        let mut orders: Vec<OrderAny> = cmd
+            .order_list
+            .client_order_ids
+            .iter()
+            .filter_map(|client_order_id| cache.order_owned(client_order_id))
+            .collect();
+        drop(cache);
+
+        for client_order_id in &cmd.order_list.client_order_ids {
+            if orders
+                .iter()
+                .any(|order| order.client_order_id() == *client_order_id)
+            {
+                continue;
+            }
+
+            let Some(order_init) = cmd
+                .order_inits
+                .iter()
+                .find(|init| init.client_order_id == *client_order_id)
+            else {
+                continue;
+            };
+
+            if let Some(order) = self.add_order_from_init(order_init, cmd.position_id, cmd) {
+                orders.push(order);
+            }
+        }
+
+        let mut eligible_orders = orders
+            .iter()
+            .filter(|order| {
+                matches!(
+                    order.status(),
+                    OrderStatus::Initialized | OrderStatus::Released
+                )
+            })
+            .peekable();
+
+        if eligible_orders.peek().is_none() {
+            log::warn!(
+                "Skipping stale submit command for order list {}",
+                cmd.order_list.id
+            );
+            return;
+        }
+
+        let reason = reason.to_string();
+        for order in eligible_orders {
+            self.deny_order(order, &reason);
         }
     }
 
@@ -4411,6 +4489,15 @@ impl ExecutionEngine {
 
         RefMut::map(cache, |c| c.own_order_book_mut(instrument_id).unwrap())
     }
+}
+
+enum SubmissionValidationResult {
+    Valid,
+    StaleOrder {
+        client_order_id: ClientOrderId,
+        status: OrderStatus,
+    },
+    Deny(OrderDeniedReason),
 }
 
 #[cfg(test)]

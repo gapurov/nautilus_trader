@@ -53,11 +53,36 @@ The adapter supports these product categories:
 | Spot tokenized assets | ✓         | Loaded from Kraken's `tokenized_asset` asset class. |
 | Futures               | ✓         | Instruments returned by the Kraken Futures API.     |
 
+:::warning
+Kraken Futures can return instrument definitions that need more than standard-precision mode's nine decimal places.
+Keep [high-precision mode](../getting_started/installation.md#precision-mode) enabled for Futures. Standard-precision
+mode continues to support Spot, but Futures clients fail to start or return instruments when any definition cannot
+be parsed. Futures catalogue requests return no partial result and never round, clamp, or omit an unsupported
+definition.
+:::
+
 :::note
 **Single product type per client**: Each Kraken data or execution client is
 configured for a single `product_type` (`SPOT` or `FUTURES`); a single client
 does not span both markets.
 :::
+
+## Spot instrument fees
+
+When both `api_key` and `api_secret` are configured, the adapter loads the
+account's current maker and taker rates for currency pairs and tokenized assets
+from Kraken's
+[`TradeVolume` endpoint](https://docs.kraken.com/api-reference/account-data/get-trade-volume).
+The API key must include the `Funds permissions - Query` permission, shown as
+**Query Funds** when creating the key.
+
+If `TradeVolume` fails or omits any requested pair, the Spot data or execution
+client cannot connect. The adapter does not silently publish instruments with
+public base-tier fees. For pairs without a maker/taker schedule, Kraken returns
+one fee, which the adapter applies to both maker and taker activity.
+
+Without Spot API credentials, the adapter uses the public base-tier rates from
+`AssetPairs`. These rates can differ from the account's actual fee tier.
 
 ## Bar streaming
 
@@ -287,12 +312,12 @@ more events per instrument than L2. Recommended settings:
 
 ### Execution instructions
 
-| Instruction      | Spot | Futures | Notes                                                          |
-| ---------------- | ---- | ------- | -------------------------------------------------------------- |
-| `post_only`      | ✓    | ✓       | Available for limit orders.                                    |
-| `reduce_only`    | ✓    | ✓       | Spot requires `spot_account_type=Margin` (margin orders only). |
-| `quote_quantity` | ✓    | -       | Spot only. Volume in quote currency (`viqc`); REST routed.     |
-| `display_qty`    | ✓    | -       | Spot only. Iceberg orders (`displayvol`).                      |
+| Instruction      | Spot | Futures | Notes                                                      |
+| ---------------- | ---- | ------- | ---------------------------------------------------------- |
+| `post_only`      | ✓    | ✓       | Available for limit orders.                                |
+| `reduce_only`    | ✓    | ✓       | Spot requires a margin account and resolved leverage.      |
+| `quote_quantity` | ✓    | -       | Spot only. Volume in quote currency (`viqc`); REST routed. |
+| `display_qty`    | ✓    | -       | Spot only. Iceberg orders (`displayvol`).                  |
 
 ### Trigger types
 
@@ -315,7 +340,7 @@ time rather than silently coercing them.
 | Operation    | Spot | Futures | Notes                                                  |
 | ------------ | ---- | ------- | ------------------------------------------------------ |
 | Batch Submit | ✓    | ✓       | Spot chunks at 15 orders. Futures chunks at 10.        |
-| Batch Modify | -    | ✓       | Futures HTTP helper only. Execution sends one command. |
+| Batch Modify | -    | ✓       | Futures HTTP method only. Execution sends one command. |
 | Batch Cancel | ✓    | ✓       | Auto-chunks into batches of 50.                        |
 
 :::note
@@ -436,6 +461,15 @@ the exchange state at startup or during operation.
 - Trade history: Fetches execution history with pagination.
 - Time-bounded queries: Supports filtering by start/end timestamps.
 - All fill types: Market, limit, and conditional order fills.
+
+**Account balances:**
+
+- Wallet balances: Fetched from `POST /0/private/BalanceEx`, which reports both the
+  total and the held (`hold_trade`) amount per asset. The held amount populates
+  `AccountBalance.locked`, so `free` excludes funds Kraken has reserved against
+  resting orders. For accounts with a credit line, net credit (`credit - credit_used`)
+  is included in `AccountBalance.total`, so `free` matches Kraken's available balance
+  of `balance + credit - credit_used - hold_trade`.
 
 **Margin position reports** (when `spot_account_type=Margin`):
 
@@ -569,8 +603,9 @@ an invalid tier produces an `OrderDenied` event and never hits the venue.
 ### Reduce-only
 
 Margin orders can carry `reduce_only=True` so they reduce an existing position
-without opening a larger opposite position. The adapter denies cash orders with
-`reduce_only` before sending them to Kraken.
+without opening a larger opposite position. Set `spot_account_type=Margin` and supply
+either `default_leverage` or per-order `params={"leverage": N}`. The adapter denies
+cash orders with `reduce_only` before sending them to Kraken.
 
 ### Account state
 
@@ -666,8 +701,8 @@ The product type for each client is specified via the `product_type` option.
 | ------------------------- | --------- | -------------------------------------------------------------- |
 | `product_type`            | `SPOT`    | Product type for this client (`SPOT` or `FUTURES`).            |
 | `environment`             | `LIVE`    | Trading environment (`LIVE` or `DEMO`); demo only for Futures. |
-| `api_key`                 | `None`    | API key for authenticated Spot data such as L3.                |
-| `api_secret`              | `None`    | API secret for authenticated Spot data such as L3.             |
+| `api_key`                 | `None`    | API key for Spot L3 data and account fee rates.                |
+| `api_secret`              | `None`    | API secret for Spot L3 data and account fee rates.             |
 | `base_url`                | `None`    | Override for the Kraken REST base URL.                         |
 | `ws_public_url`           | `None`    | Override for the public WebSocket URL.                         |
 | `ws_private_url`          | `None`    | Override for the private WebSocket URL.                        |
@@ -696,6 +731,7 @@ The product type for each client is specified via the `product_type` option.
 | `heartbeat_interval_secs`       | `30`      | WebSocket heartbeat interval in seconds.                              |
 | `auth_timeout_secs`             | `None`    | Futures WebSocket auth timeout; `None` uses the client default.       |
 | `max_requests_per_second`       | `None`    | Per-client request throttle; default is 5 req/s.                      |
+| `max_retries`                   | `3`       | Maximum retry attempts for retryable REST requests.                   |
 | `spot_account_type`             | `CASH`    | Account type for spot trading; `MARGIN` enables leverage and reports. |
 | `default_leverage`              | `None`    | Default spot margin leverage sent as `"N:1"` when set.                |
 | `use_spot_position_reports`     | `False`   | Report wallet balances as positions; cash mode only.                  |
@@ -736,8 +772,9 @@ execution clients.
 
 Live-node configuration objects do not read credential environment variables
 automatically. Pass `api_key` and `api_secret` explicitly to
-`KrakenExecutionClientConfig` and, for Spot L3 data, to `KrakenDataClientConfig`.
-Public market data does not require credentials.
+`KrakenExecutionClientConfig` and, for Spot L3 data or account-specific
+instrument fees, to `KrakenDataClientConfig`. Public market data does not
+require credentials.
 
 The lower-level Python HTTP and WebSocket clients load the following variables
 when their credential arguments are omitted. Rust applications can use

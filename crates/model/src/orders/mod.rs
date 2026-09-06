@@ -265,6 +265,7 @@ impl OrderStatus {
             (Self::PendingUpdate, OrderEventAny::FillVoided(_)) => Self::PendingUpdate,
             (Self::PendingCancel, OrderEventAny::Rejected(_)) => Self::Rejected,
             (Self::PendingCancel, OrderEventAny::PendingCancel(_)) => Self::PendingCancel,  // Allow multiple requests
+            (Self::PendingCancel, OrderEventAny::ModifyRejected(_)) => Self::PendingCancel, // Preserve in-flight cancellation
             (Self::PendingCancel, OrderEventAny::CancelRejected(_)) => Self::PendingCancel,  // Handled by cancel_rejected to restore previous_status
             (Self::PendingCancel, OrderEventAny::Canceled(_)) => Self::Canceled,
             (Self::PendingCancel, OrderEventAny::Expired(_)) => Self::Expired,
@@ -995,7 +996,9 @@ impl OrderCore {
     }
 
     fn modify_rejected(&mut self, _event: &OrderModifyRejected, previous_status: OrderStatus) {
-        self.status = previous_status;
+        if self.status != OrderStatus::PendingCancel {
+            self.status = previous_status;
+        }
     }
 
     fn cancel_rejected(&mut self, _event: &OrderCancelRejected, previous_status: OrderStatus) {
@@ -3601,6 +3604,39 @@ mod tests {
         order
             .apply(OrderEventAny::ModifyRejected(modify_rejected))
             .unwrap();
+        assert_eq!(order.status(), OrderStatus::Accepted);
+    }
+
+    #[rstest]
+    fn test_modify_rejected_preserves_pending_cancel() {
+        let init = OrderInitializedSpec::builder().build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let pending_update = OrderPendingUpdateSpec::builder().build();
+        let pending_cancel = OrderPendingCancelSpec::builder().build();
+        let modify_rejected = OrderModifyRejectedSpec::builder().build();
+        let cancel_rejected = OrderCancelRejectedSpec::builder().build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order
+            .apply(OrderEventAny::PendingUpdate(pending_update))
+            .unwrap();
+        order
+            .apply(OrderEventAny::PendingCancel(pending_cancel))
+            .unwrap();
+        order
+            .apply(OrderEventAny::ModifyRejected(modify_rejected))
+            .unwrap();
+
+        assert_eq!(order.status(), OrderStatus::PendingCancel);
+        assert_eq!(order.previous_status(), Some(OrderStatus::Accepted));
+
+        order
+            .apply(OrderEventAny::CancelRejected(cancel_rejected))
+            .unwrap();
+
         assert_eq!(order.status(), OrderStatus::Accepted);
     }
 

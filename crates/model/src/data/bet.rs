@@ -411,13 +411,8 @@ impl BetPosition {
     pub fn add_bet(&mut self, bet: Bet) {
         match self.side() {
             None => self.position_increase(&bet),
-            Some(current_side) => {
-                if current_side == bet.side {
-                    self.position_increase(&bet);
-                } else {
-                    self.position_decrease(&bet);
-                }
-            }
+            Some(current_side) if current_side == bet.side => self.position_increase(&bet),
+            Some(_) => self.position_decrease(&bet),
         }
         self.bets.push(bet);
     }
@@ -590,9 +585,6 @@ impl BetPosition {
     ///
     /// Returns an error if flattening or marking the position overflows or divides by zero.
     pub fn unrealized_pnl_checked(&self, price: Decimal) -> anyhow::Result<Decimal> {
-        if self.side().is_none() {
-            return Ok(Decimal::ZERO);
-        }
         let Some(flattening_bet) = self.flattening_bet_checked(price)? else {
             return Ok(Decimal::ZERO);
         };
@@ -752,11 +744,7 @@ pub fn inverse_probability_to_bet(
 ) -> anyhow::Result<Bet> {
     check_probability_invertible(probability)?;
     let inverse_probability = checked_sub(Decimal::ONE, probability)?;
-    let inverse_side = match side {
-        OrderSide::Buy => OrderSide::Sell,
-        OrderSide::Sell => OrderSide::Buy,
-    };
-    probability_to_bet(inverse_probability, volume, inverse_side)
+    probability_to_bet(inverse_probability, volume, side.opposite())
 }
 
 fn check_odds_gt_one(price: Decimal) -> anyhow::Result<()> {

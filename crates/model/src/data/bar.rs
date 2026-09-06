@@ -768,19 +768,13 @@ impl BarType {
     /// Returns whether this instance is a standard bar type.
     #[must_use]
     pub fn is_standard(&self) -> bool {
-        match &self {
-            Self::Standard { .. } => true,
-            Self::Composite { .. } => false,
-        }
+        matches!(self, Self::Standard { .. })
     }
 
     /// Returns whether this instance is a composite bar type.
     #[must_use]
     pub fn is_composite(&self) -> bool {
-        match &self {
-            Self::Standard { .. } => false,
-            Self::Composite { .. } => true,
-        }
+        matches!(self, Self::Composite { .. })
     }
 
     /// Returns whether the bar aggregation source is `EXTERNAL`.

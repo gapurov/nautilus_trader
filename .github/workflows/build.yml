@@ -49,6 +49,7 @@ jobs:
     outputs:
       run-tests: ${{ steps.plan.outputs.run_tests }}
       run-rust-tests: ${{ steps.plan.outputs.run_rust_tests }}
+      github-changed: ${{ steps.plan.outputs.github_changed }}
       untrusted_pr: ${{ steps.policy.outputs.untrusted_pr }}
       publish_r2: ${{ steps.wheel-publication.outputs.publish_r2 }}
       publish_development: ${{ steps.wheel-publication.outputs.publish_development }}
@@ -149,6 +150,8 @@ jobs:
           sudo apt-get install -y ripgrep -o Acquire::Retries=5
 
       - name: Check GitHub Action pins
+        # One network round trip per pinned reference, so only when they changed
+        if: needs.plan.outputs.github-changed == 'true'
         run: make check-github-action-pins
 
       - name: Check Docker toolchain pins
@@ -194,7 +197,7 @@ jobs:
         && needs.plan.outputs.untrusted_pr != 'false'
         && 'ci-pr'
         || 'nextest' }}
-      # Scopes incremental clippy/doc checks; empty for non-PR/push events.
+      # Scopes changed-package Rust checks; empty for non-PR/push events.
       CHANGED_BASE_SHA: >-
         ${{ github.event.pull_request.base.sha || github.event.before }}
     steps:
@@ -532,15 +535,6 @@ jobs:
 
       - name: Report disk space before Rust tests
         run: bash scripts/ci/report-disk-space.bash "before Rust tests"
-
-      - name: Run Rust doctests
-        run: >-
-          make cargo-test-doc
-          EXTRA_FEATURES="capnp,hypersync,nautilus-serialization/sbe,nautilus-infrastructure/postgres"
-
-      - name: Report disk space after Rust doctests
-        if: always()
-        run: bash scripts/ci/report-disk-space.bash "after Rust doctests"
 
       - name: Run Rust tests
         run: >-

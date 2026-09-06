@@ -37,7 +37,7 @@ use rust_decimal::Decimal;
 use thiserror::Error;
 
 use super::{
-    order_builder::{PolymarketOrderBuilder, signed_limit_order_quantity},
+    order_builder::PolymarketOrderBuilder,
     parse::{adjust_market_buy_amount, calculate_market_price},
     types::{LimitOrderSubmitRequest, SignedLimitOrderSubmission},
 };
@@ -226,7 +226,7 @@ impl OrderSubmitter {
 
         let response = match self
             .retry_manager
-            .execute_with_retry_with_delay(
+            .invocation(
                 "submit_market_order",
                 || {
                     let http_client = http_client.clone();
@@ -243,9 +243,10 @@ impl OrderSubmitter {
                     }
                 },
                 |e| e.is_retryable(),
-                Error::retry_after,
                 |e| submit_retry_error(e, &saw_unknown_outcome),
             )
+            .retry_delay(&Error::retry_after)
+            .execute()
             .await
         {
             Ok(response) => {
@@ -300,7 +301,7 @@ impl OrderSubmitter {
         let order_id = venue_order_id.to_string();
 
         self.retry_manager
-            .execute_with_retry_with_delay(
+            .invocation(
                 "cancel_order",
                 || {
                     let http_client = http_client.clone();
@@ -308,9 +309,10 @@ impl OrderSubmitter {
                     async move { http_client.cancel_order(&order_id).await }
                 },
                 |e| e.is_retryable(),
-                Error::retry_after,
                 |e| Error::transport(e.to_string()),
             )
+            .retry_delay(&Error::retry_after)
+            .execute()
             .await
     }
 
@@ -320,7 +322,7 @@ impl OrderSubmitter {
         let asset_id = asset_id.to_string();
 
         self.retry_manager
-            .execute_with_retry_with_delay(
+            .invocation(
                 "cancel_market_orders",
                 || {
                     let http_client = http_client.clone();
@@ -335,9 +337,10 @@ impl OrderSubmitter {
                     }
                 },
                 |e| e.is_retryable(),
-                Error::retry_after,
                 |e| Error::transport(e.to_string()),
             )
+            .retry_delay(&Error::retry_after)
+            .execute()
             .await
     }
 
@@ -376,7 +379,7 @@ impl OrderSubmitter {
         let order_ids = order_ids.to_vec();
 
         self.retry_manager
-            .execute_with_retry_with_delay(
+            .invocation(
                 "cancel_orders",
                 || {
                     let http_client = http_client.clone();
@@ -387,9 +390,10 @@ impl OrderSubmitter {
                     }
                 },
                 |e| e.is_retryable(),
-                Error::retry_after,
                 |e| Error::transport(e.to_string()),
             )
+            .retry_delay(&Error::retry_after)
+            .execute()
             .await
     }
 
@@ -404,7 +408,7 @@ impl OrderSubmitter {
         let oid = order_id.to_string();
 
         self.retry_manager
-            .execute_with_retry_with_delay(
+            .invocation(
                 "get_order",
                 || {
                     let http_client = http_client.clone();
@@ -412,9 +416,10 @@ impl OrderSubmitter {
                     async move { http_client.get_order_optional(&oid).await }
                 },
                 |e| e.is_retryable(),
-                Error::retry_after,
                 |e| Error::transport(e.to_string()),
             )
+            .retry_delay(&Error::retry_after)
+            .execute()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to fetch order status: {e}"))
     }
@@ -439,9 +444,21 @@ impl OrderSubmitter {
         let side = PolymarketOrderSide::from(request.side);
         let expiration = limit_order_expiration(request.expire_time);
 
-        let order = self
-            .order_builder
-            .build_limit_order(
+        let order = if request.quote_quantity {
+            anyhow::ensure!(
+                side == PolymarketOrderSide::Buy,
+                "Limit SELL orders require quote_quantity=false (amount in shares)"
+            );
+            self.order_builder.build_limit_order_from_collateral(
+                &request.token_id,
+                request.price.as_decimal(),
+                request.quantity.as_decimal(),
+                &expiration,
+                request.neg_risk,
+                request.tick_decimals,
+            )
+        } else {
+            self.order_builder.build_limit_order(
                 &request.token_id,
                 side,
                 request.price.as_decimal(),
@@ -451,7 +468,22 @@ impl OrderSubmitter {
                 request.neg_risk,
                 request.tick_decimals,
             )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let signed_base_qty = signed_base_quantity(order.maker_amount, order.taker_amount, side);
+        let expected_base_qty =
+            Quantity::from_decimal_dp(signed_base_qty, request.size_precision).map_err(|e| {
+                anyhow::anyhow!(
+                    "Signed limit order share quantity {signed_base_qty} is invalid at instrument size precision {}: {e}",
+                    request.size_precision,
+                )
+            })?;
+        anyhow::ensure!(
+            expected_base_qty.as_decimal() == signed_base_qty,
+            "Signed limit order share quantity {signed_base_qty} cannot be represented exactly at instrument size precision {}",
+            request.size_precision,
+        );
 
         let expected_venue_order_id = self
             .order_builder
@@ -462,7 +494,7 @@ impl OrderSubmitter {
             order_type,
             post_only: request.post_only,
             expected_venue_order_id,
-            expected_base_qty: signed_limit_order_quantity(request.quantity.as_decimal()),
+            expected_base_qty,
         })
     }
 
@@ -475,7 +507,7 @@ impl OrderSubmitter {
 
         let result = self
             .retry_manager
-            .execute_with_retry_with_delay(
+            .invocation(
                 "submit_limit_order",
                 || {
                     let http_client = http_client.clone();
@@ -498,9 +530,10 @@ impl OrderSubmitter {
                     }
                 },
                 |e| e.is_retryable(),
-                Error::retry_after,
                 |e| submit_retry_error(e, &saw_unknown_outcome),
             )
+            .retry_delay(&Error::retry_after)
+            .execute()
             .await;
 
         match result {

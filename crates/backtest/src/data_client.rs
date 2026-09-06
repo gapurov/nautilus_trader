@@ -28,8 +28,8 @@ use nautilus_common::{
     cache::Cache,
     clients::DataClient,
     messages::data::{
-        RequestBars, RequestBookSnapshot, RequestCustomData, RequestForwardPrices,
-        RequestInstrument, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars,
+        RequestBars, RequestBookSnapshot, RequestCustomData, RequestInstrument, RequestInstruments,
+        RequestOptionChainReferencePrice, RequestQuotes, RequestTrades, SubscribeBars,
         SubscribeBookDeltas, SubscribeBookDepth10, SubscribeCustomData, SubscribeIndexPrices,
         SubscribeInstrument, SubscribeInstrumentClose, SubscribeInstrumentStatus,
         SubscribeInstruments, SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades,
@@ -320,10 +320,11 @@ impl DataClient for BacktestDataClient {
         Ok(())
     }
 
-    fn request_forward_prices(&self, _request: RequestForwardPrices) -> anyhow::Result<()> {
-        // No live ATM source in backtest; return Err so the engine fallback
-        // creates the option-chain manager without an initial ATM price.
-        anyhow::bail!("backtest data client cannot fetch forward prices")
+    fn request_option_chain_reference_price(
+        &self,
+        _request: RequestOptionChainReferencePrice,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("backtest data client cannot fetch option-chain reference prices")
     }
 
     #[cfg(feature = "defi")]
@@ -335,29 +336,35 @@ impl DataClient for BacktestDataClient {
 #[cfg(test)]
 mod tests {
     use nautilus_core::{UUID4, UnixNanos};
+    use nautilus_model::identifiers::{InstrumentId, OptionSeriesId};
     use rstest::rstest;
     use ustr::Ustr;
 
     use super::*;
 
     #[rstest]
-    fn test_request_forward_prices_returns_err_for_engine_fallback() {
+    fn test_option_chain_reference_price_is_unsupported() {
         let client_id = ClientId::new("BACKTEST");
         let venue = Venue::new("BACKTEST");
         let cache = Rc::new(RefCell::new(Cache::default()));
         let client = BacktestDataClient::new(client_id, venue, cache);
-
-        let request = RequestForwardPrices::new(
+        let series_id = OptionSeriesId::new(
             venue,
             Ustr::from("BTC"),
-            None,
+            Ustr::from("BTC"),
+            UnixNanos::default(),
+        );
+
+        let request = RequestOptionChainReferencePrice::new(
+            series_id,
+            InstrumentId::from("BTC-TEST-50000-C.BACKTEST"),
             Some(client_id),
             UUID4::new(),
             UnixNanos::default(),
             None,
         );
 
-        let result = client.request_forward_prices(request);
+        let result = client.request_option_chain_reference_price(request);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("backtest data client"));

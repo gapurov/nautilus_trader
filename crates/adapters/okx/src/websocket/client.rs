@@ -40,7 +40,7 @@ use nautilus_core::{
     AtomicMap,
     consts::NAUTILUS_USER_AGENT,
     env::{get_env_var, get_or_env_var},
-    string::secret::REDACTED,
+    string::secret::{REDACTED, SecretString},
 };
 use nautilus_live::{
     SocketControl,
@@ -82,7 +82,7 @@ use super::{
 use crate::common::{
     consts::{
         OKX_NAUTILUS_BROKER_ID, OKX_SUPPORTED_ORDER_TYPES, OKX_SUPPORTED_TIME_IN_FORCE,
-        OKX_WS_PUBLIC_URL, OKX_WS_TOPIC_DELIMITER, select_book_channel,
+        OKX_WS_PUBLIC_URL, OKX_WS_TOPIC_DELIMITER, okx_reduce_only_wire_value, select_book_channel,
     },
     credential::Credential,
     enums::{
@@ -248,7 +248,7 @@ pub struct OKXWebSocketClient {
     /// WebSocket transport backend (defaults to `Tungstenite`).
     transport_backend: TransportBackend,
     /// Optional proxy URL for the WebSocket transport.
-    proxy_url: Option<String>,
+    proxy_url: Option<SecretString>,
     cancellation_token: CancellationToken,
     socket_control: Option<Arc<SocketControl>>,
 }
@@ -381,7 +381,7 @@ impl OKXWebSocketClient {
             index_pair_subscribers: Arc::new(DashMap::new()),
             index_pair_transition: Arc::new(tokio::sync::Mutex::new(())),
             transport_backend,
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             cancellation_token: CancellationToken::new(),
             socket_control: None,
         })
@@ -649,7 +649,10 @@ impl OKXWebSocketClient {
             heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
-            proxy_url: self.proxy_url.clone(),
+            proxy_url: self
+                .proxy_url
+                .as_ref()
+                .map(|value| value.expose_secret().to_owned()),
         };
 
         let keyed_quotas = vec![
@@ -740,7 +743,6 @@ impl OKXWebSocketClient {
                     subscriptions_state.clone(),
                 );
 
-                // Helper closure to resubscribe all tracked subscriptions after reconnection
                 let resubscribe_all = || {
                     for entry in subscriptions_inst_id.iter() {
                         let (channel, inst_ids) = entry.pair();
@@ -845,14 +847,16 @@ impl OKXWebSocketClient {
                                 let auth_message = super::messages::OKXAuthentication {
                                     op: "login",
                                     args: vec![super::messages::OKXAuthenticationArg {
-                                        api_key: cred.api_key().to_string(),
-                                        passphrase: cred.api_passphrase().to_string(),
+                                        api_key: SecretString::from(cred.api_key()),
+                                        passphrase: SecretString::from(cred.api_passphrase()),
                                         timestamp,
-                                        sign: signature,
+                                        sign: SecretString::from(signature),
                                     }],
                                 };
 
-                                if let Ok(payload) = serde_json::to_string(&auth_message) {
+                                if let Ok(payload) =
+                                    serde_json::to_string(&auth_message).map(SecretString::from)
+                                {
                                     if let Err(e) = cmd_tx_for_reconnect
                                         .send(HandlerCommand::Authenticate { payload })
                                     {
@@ -981,19 +985,20 @@ impl OKXWebSocketClient {
         let auth_message = OKXAuthentication {
             op: "login",
             args: vec![OKXAuthenticationArg {
-                api_key: credential.api_key().to_string(),
-                passphrase: credential.api_passphrase().to_string(),
+                api_key: SecretString::from(credential.api_key()),
+                passphrase: SecretString::from(credential.api_passphrase()),
                 timestamp,
-                sign: signature,
+                sign: SecretString::from(signature),
             }],
         };
 
-        let payload = serde_json::to_string(&auth_message).map_err(|e| {
-            Error::Io(std::io::Error::other(format!(
-                "Failed to serialize auth message: {e}"
-            )))
-        })?;
-
+        let payload = serde_json::to_string(&auth_message)
+            .map(SecretString::from)
+            .map_err(|e| {
+                Error::Io(std::io::Error::other(format!(
+                    "Failed to serialize auth message: {e}"
+                )))
+            })?;
         self.cmd_tx
             .read()
             .await
@@ -2590,7 +2595,6 @@ impl OKXWebSocketClient {
                 if position_side.is_none() {
                     builder.pos_side(OKXPositionSide::Net);
                 }
-                // reduceOnly is not applicable to options per OKX docs
             }
             OKXInstrumentType::Events => {}
             _ => {
@@ -2602,8 +2606,16 @@ impl OKXWebSocketClient {
             }
         }
 
-        if should_send_reduce_only(instrument_type, td_mode, position_side, reduce_only) {
-            builder.reduce_only(true);
+        if let Some(reduce_only) = okx_reduce_only_wire_value(
+            instrument_type,
+            td_mode,
+            order_side,
+            position_side,
+            reduce_only,
+        )
+        .map_err(OKXWsError::ClientError)?
+        {
+            builder.reduce_only(reduce_only);
         }
 
         if let Some(attach_algo_ords) = attach_algo_ords {
@@ -3173,8 +3185,11 @@ impl OKXWebSocketClient {
                     builder.px(p.to_string());
                 }
 
-                if should_send_reduce_only(inst_type, td_mode, pos_side, reduce_only) {
-                    builder.reduce_only(true);
+                if let Some(reduce_only) =
+                    okx_reduce_only_wire_value(inst_type, td_mode, ord_side, pos_side, reduce_only)
+                        .map_err(OKXWsError::ClientError)?
+                {
+                    builder.reduce_only(reduce_only);
                 }
 
                 let speed_bump = if inst_type == OKXInstrumentType::Events {
@@ -3552,24 +3567,6 @@ impl OKXWebSocketClient {
             .await
             .send(cmd)
             .map_err(|e| OKXWsError::HandlerUnavailable(e.to_string()))
-    }
-}
-
-fn should_send_reduce_only(
-    instrument_type: OKXInstrumentType,
-    td_mode: OKXTradeMode,
-    position_side: Option<PositionSide>,
-    reduce_only: Option<bool>,
-) -> bool {
-    if reduce_only != Some(true) {
-        return false;
-    }
-
-    match instrument_type {
-        OKXInstrumentType::Spot | OKXInstrumentType::Margin => td_mode != OKXTradeMode::Cash,
-        OKXInstrumentType::Swap | OKXInstrumentType::Futures => position_side.is_none(),
-        OKXInstrumentType::Any => true,
-        OKXInstrumentType::Option | OKXInstrumentType::Events => false,
     }
 }
 

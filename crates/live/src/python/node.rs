@@ -54,7 +54,7 @@ use nautilus_core::{
 };
 use nautilus_model::{
     enums::OmsType,
-    identifiers::{ActorId, ExecAlgorithmId, InstrumentId, TraderId},
+    identifiers::{ActorId, ExecAlgorithmId, InstrumentId, StrategyId, TraderId},
 };
 use nautilus_portfolio::{config::PortfolioConfig, python::PyPortfolio};
 use nautilus_system::get_global_pyo3_registry;
@@ -92,7 +92,7 @@ use crate::{
         PluginConfig,
     },
     node::{LiveNode, LiveNodeHandle, NodeRunMode, config::RoutingConfig},
-    python::config::coerce_json_config,
+    python::config::{coerce_json_config, json_value_to_py},
 };
 
 /// Python-facing wrapper owning a [`LiveNode`].
@@ -900,6 +900,33 @@ impl PyLiveNode {
         }
     }
 
+    /// Adds a callback for supported typed external messages.
+    ///
+    /// While `run` or `run_async` services external ingress, the node invokes callbacks in
+    /// registration order before normal inbound streaming filters for recognized JSON or
+    /// MessagePack typed payloads. Each callback receives an encoding-independent Python mapping
+    /// that follows the concrete payload's serialized object shape and adds a `payload_type` field.
+    /// Other encodings are skipped with a warning. External egress is suppressed while the callback
+    /// runs, so synchronous publications remain local. Callback exceptions are logged, stop the
+    /// remaining processors, and skip internal republishing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node is no longer available for mutation.
+    #[pyo3(name = "add_stream_processor")]
+    fn py_add_stream_processor(&self, callback: Py<PyAny>) -> PyResult<()> {
+        self.node_mut()?
+            .add_stream_processor_with_mapping(move |_, mapping| {
+                Python::attach(|py| {
+                    let payload = json_value_to_py(py, mapping)?;
+                    callback.call1(py, (payload,))?;
+                    Ok(())
+                })
+                .map_err(|e: PyErr| anyhow::anyhow!("Python stream processor failed: {e}"))
+            });
+        Ok(())
+    }
+
     /// Runs the live node on the caller's asyncio event loop.
     ///
     /// Takes the node and returns an awaitable that resolves once the node has stopped. The host
@@ -1182,11 +1209,11 @@ impl PyLiveNode {
     /// Returns an error if:
     /// - The node is currently running.
     /// - A strategy with the same ID is already registered.
-    /// - The strategy configures one or more external order claims and the request repeats
-    ///   an instrument, or either tier already contains a requested claim.
-    /// - The strategy configures one or more external order claims or an OMS type override,
-    ///   and the execution engine is already borrowed. A strategy configuring neither does
-    ///   not take the borrow and cannot fail this way.
+    /// - The configured external order instrument IDs repeat an instrument or the cache already
+    ///   contains a requested claim.
+    /// - The strategy configures one or more external order instrument IDs and the cache is already
+    ///   borrowed.
+    /// - The strategy configures an OMS type override and the execution engine is already borrowed.
     #[allow(
         unsafe_code,
         reason = "Required for Python strategy component registration"
@@ -1211,7 +1238,7 @@ impl PyLiveNode {
             .prepare_python_strategy_instance(&strategy)
             .map_err(to_pyruntime_err)?;
 
-        let (external_order_claims, oms_type) = Python::attach(
+        let (external_order_instrument_ids, oms_type) = Python::attach(
             |py| -> anyhow::Result<(Option<Vec<InstrumentId>>, Option<OmsType>)> {
                 let bound = strategy.bind(py);
                 let config_obj = bound
@@ -1225,12 +1252,13 @@ impl PyLiveNode {
                     .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
 
                 if let Some(config_obj) = config_obj.as_ref()
-                    && let Some(claims) = extract_external_order_claims_config_attr(config_obj)?
+                    && let Some(claims) =
+                        extract_external_order_instrument_ids_config_attr(config_obj)?
                 {
-                    py_strategy_ref.set_external_order_claims(Some(claims));
+                    py_strategy_ref.set_external_order_instrument_ids(Some(claims));
                 }
 
-                let claims = py_strategy_ref.external_order_claims();
+                let claims = py_strategy_ref.external_order_instrument_ids();
                 let oms_type = config_obj
                     .as_ref()
                     .and_then(|cfg| cfg.getattr("oms_type").ok())
@@ -1242,18 +1270,33 @@ impl PyLiveNode {
         )
         .map_err(to_pyruntime_err)?;
 
-        if let Some(claims) = external_order_claims.filter(|claims| !claims.is_empty()) {
+        let external_order_instrument_ids =
+            external_order_instrument_ids.filter(|claims| !claims.is_empty());
+        if let Some(claims) = &external_order_instrument_ids {
             self.node_mut()?
-                .register_external_order_claims(strategy_id, &claims)
+                .register_external_order_claims(strategy_id, claims)
                 .map_err(to_pyruntime_err)?;
         }
 
-        self.node_mut()?
+        let commit_result = self
+            .node_mut()?
             .kernel_mut()
             .trader
             .borrow_mut()
-            .commit_python_strategy_instance(&strategy)
-            .map_err(to_pyruntime_err)?;
+            .commit_python_strategy_instance(&strategy);
+
+        if let Err(commit_error) = commit_result {
+            if let Some(instrument_ids) = external_order_instrument_ids.as_deref()
+                && let Err(rollback_error) = self
+                    .node_mut()?
+                    .rollback_external_order_claims(strategy_id, instrument_ids)
+            {
+                return Err(to_pyruntime_err(format!(
+                    "Failed to add strategy {strategy_id}: {commit_error}; failed to roll back external order claims: {rollback_error}"
+                )));
+            }
+            return Err(to_pyruntime_err(commit_error));
+        }
 
         if let Some(oms_type) = oms_type {
             self.node_mut()?
@@ -1332,9 +1375,9 @@ impl PyLiveNode {
                 .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
 
             if let Some(config_obj) = config_obj.as_ref()
-                && let Some(claims) = extract_external_order_claims_config_attr(config_obj)?
+                && let Some(claims) = extract_external_order_instrument_ids_config_attr(config_obj)?
             {
-                py_strategy_ref.set_external_order_claims(Some(claims));
+                py_strategy_ref.set_external_order_instrument_ids(Some(claims));
             }
 
             Ok(())
@@ -1342,30 +1385,46 @@ impl PyLiveNode {
         .map_err(to_pyruntime_err)?;
 
         // Phase 2: Claim external orders before committing, matching the instance path
-        let external_order_claims = Python::attach(|py| -> anyhow::Result<Option<Vec<_>>> {
-            let py_strategy = python_strategy.bind(py);
-            let py_strategy_ref = py_strategy
-                .extract::<PyRef<PyStrategy>>()
-                .map_err(Into::<PyErr>::into)
-                .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
+        let external_order_instrument_ids =
+            Python::attach(|py| -> anyhow::Result<Option<Vec<_>>> {
+                let py_strategy = python_strategy.bind(py);
+                let py_strategy_ref = py_strategy
+                    .extract::<PyRef<PyStrategy>>()
+                    .map_err(Into::<PyErr>::into)
+                    .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
 
-            Ok(py_strategy_ref.external_order_claims())
-        })
-        .map_err(to_pyruntime_err)?;
+                Ok(py_strategy_ref.external_order_instrument_ids())
+            })
+            .map_err(to_pyruntime_err)?;
 
-        if let Some(claims) = external_order_claims.filter(|claims| !claims.is_empty()) {
+        let external_order_instrument_ids =
+            external_order_instrument_ids.filter(|claims| !claims.is_empty());
+        if let Some(claims) = &external_order_instrument_ids {
             self.node_mut()?
-                .register_external_order_claims(strategy_id, &claims)
+                .register_external_order_claims(strategy_id, claims)
                 .map_err(to_pyruntime_err)?;
         }
 
         // Phase 3: Register the strategy through the trader's single Python registration path
-        self.node_mut()?
+        let commit_result = self
+            .node_mut()?
             .kernel_mut()
             .trader
             .borrow_mut()
-            .commit_python_strategy_instance(&python_strategy)
-            .map_err(to_pyruntime_err)?;
+            .commit_python_strategy_instance(&python_strategy);
+
+        if let Err(commit_error) = commit_result {
+            if let Some(instrument_ids) = external_order_instrument_ids.as_deref()
+                && let Err(rollback_error) = self
+                    .node_mut()?
+                    .rollback_external_order_claims(strategy_id, instrument_ids)
+            {
+                return Err(to_pyruntime_err(format!(
+                    "Failed to add strategy {strategy_id}: {commit_error}; failed to roll back external order claims: {rollback_error}"
+                )));
+            }
+            return Err(to_pyruntime_err(commit_error));
+        }
 
         log::info!("Registered Python strategy {strategy_id}");
         Ok(())
@@ -1706,7 +1765,7 @@ fn stop_live_node_detached(py: Python<'_>, node: &mut LiveNode) -> PyResult<()> 
 
 /// Creates a Python config instance from a config path and config dictionary.
 ///
-/// This helper is shared between `add_actor_from_config` and `add_strategy_from_config`.
+/// This constructor is shared by `add_actor_from_config` and `add_strategy_from_config`.
 /// It handles:
 /// 1. Importing the config class from the module path
 /// 2. Converting the `HashMap<String, serde_json::Value>` to a Python dict
@@ -1765,7 +1824,7 @@ fn create_config_instance<'py>(
                         let py_value = config_value_to_py(py, key, value)?;
 
                         if let Err(setattr_err) = instance.setattr(key, py_value) {
-                            log::warn!("Failed to set attribute {key}: {setattr_err}");
+                            anyhow::bail!("Failed to set attribute {key}: {setattr_err}");
                         }
                     }
 
@@ -1805,6 +1864,14 @@ fn config_value_to_py<'py>(
             .into_any());
     }
 
+    if key == "strategy_id"
+        && let Some(strategy_id) = value.as_str()
+    {
+        return Ok(StrategyId::new_checked(strategy_id)?
+            .into_pyobject(py)?
+            .into_any());
+    }
+
     let json_str = serde_json::to_string(value)
         .map_err(|e| anyhow::anyhow!("Failed to serialize config value: {e}"))?;
     Ok(PyModule::import(py, "json")?
@@ -1823,10 +1890,10 @@ fn extract_bool_config_attr(config_obj: &Bound<'_, PyAny>, attr: &str) -> Option
         .and_then(|val| val.extract::<bool>().ok())
 }
 
-fn extract_external_order_claims_config_attr(
+fn extract_external_order_instrument_ids_config_attr(
     config_obj: &Bound<'_, PyAny>,
 ) -> anyhow::Result<Option<Vec<InstrumentId>>> {
-    let Ok(claims) = config_obj.getattr("external_order_claims") else {
+    let Ok(claims) = config_obj.getattr("external_order_instrument_ids") else {
         return Ok(None);
     };
 
@@ -1840,12 +1907,14 @@ fn extract_external_order_claims_config_attr(
 
     let claim_strings = claims
         .extract::<Vec<String>>()
-        .map_err(|e| anyhow::anyhow!("Invalid `external_order_claims` type: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Invalid `external_order_instrument_ids` type: {e}"))?;
     let claims = claim_strings
         .into_iter()
         .map(|claim| {
             InstrumentId::from_str(&claim).map_err(|e| {
-                anyhow::anyhow!("Invalid `external_order_claims` instrument ID {claim}: {e}")
+                anyhow::anyhow!(
+                    "Invalid `external_order_instrument_ids` instrument ID {claim}: {e}"
+                )
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -3443,12 +3512,12 @@ class ClaimsConfig:
         self,
         strategy_id=None,
         order_id_tag=None,
-        external_order_claims=None,
+        external_order_instrument_ids=None,
         oms_type=None,
     ):
         self.strategy_id = strategy_id
         self.order_id_tag = order_id_tag
-        self.external_order_claims = external_order_claims
+        self.external_order_instrument_ids = external_order_instrument_ids
         self.oms_type = oms_type
 
 class ClaimsStrategy(Strategy):
@@ -4274,7 +4343,7 @@ class ClaimsStrategy(Strategy):
     }
 
     #[rstest]
-    fn test_add_strategy_from_config_registers_external_order_claims() {
+    fn test_add_strategy_from_config_registers_external_order_instrument_ids() {
         Python::initialize();
 
         let module_name = "test_live_node_claim_strategy";
@@ -4297,7 +4366,7 @@ class ClaimsStrategy(Strategy):
             serde_json::json!(strategy_id.to_string()),
         );
         config.insert(
-            "external_order_claims".to_string(),
+            "external_order_instrument_ids".to_string(),
             serde_json::json!([instrument_id.to_string()]),
         );
         let importable = ImportableStrategyConfig {
@@ -4361,7 +4430,10 @@ class ClaimsStrategy(Strategy):
                 .set_item("strategy_id", strategy_id.to_string())
                 .unwrap();
             kwargs
-                .set_item("external_order_claims", vec![instrument_id.to_string()])
+                .set_item(
+                    "external_order_instrument_ids",
+                    vec![instrument_id.to_string()],
+                )
                 .unwrap();
             let config = module
                 .getattr("ClaimsConfig")
@@ -4526,7 +4598,10 @@ class ClaimsStrategy(Strategy):
                 .set_item("strategy_id", first_strategy_id.to_string())
                 .unwrap();
             first_kwargs
-                .set_item("external_order_claims", vec![instrument_id.to_string()])
+                .set_item(
+                    "external_order_instrument_ids",
+                    vec![instrument_id.to_string()],
+                )
                 .unwrap();
             let first_config = module
                 .getattr("ClaimsConfig")
@@ -4546,7 +4621,10 @@ class ClaimsStrategy(Strategy):
                 .set_item("strategy_id", conflicting_strategy_id.to_string())
                 .unwrap();
             conflicting_kwargs
-                .set_item("external_order_claims", vec![instrument_id.to_string()])
+                .set_item(
+                    "external_order_instrument_ids",
+                    vec![instrument_id.to_string()],
+                )
                 .unwrap();
             let conflicting_config = module
                 .getattr("ClaimsConfig")
@@ -4616,6 +4694,7 @@ class ClaimsStrategy(Strategy):
             .map(PyLiveNode::new)
             .unwrap();
         let first_strategy_id = StrategyId::from("TAGGED-FIRST-777");
+        let instrument_id = InstrumentId::from("AUDUSD.SIM");
 
         let (error, duplicate_strategy_registered) = Python::attach(|py| {
             let module = py.import(module_name).expect("test module should import");
@@ -4642,6 +4721,12 @@ class ClaimsStrategy(Strategy):
                 .set_item("strategy_id", "TAGGED-SECOND")
                 .unwrap();
             duplicate_kwargs.set_item("order_id_tag", "777").unwrap();
+            duplicate_kwargs
+                .set_item(
+                    "external_order_instrument_ids",
+                    vec![instrument_id.to_string()],
+                )
+                .unwrap();
             let duplicate_config = module
                 .getattr("ClaimsConfig")
                 .unwrap()
@@ -4674,6 +4759,15 @@ class ClaimsStrategy(Strategy):
         assert!(error.to_string().contains("order_id_tag conflict"));
         assert!(!duplicate_strategy_registered);
         assert_eq!(strategy_ids, vec![first_strategy_id]);
+        assert_eq!(
+            node.node_mut()
+                .unwrap()
+                .kernel()
+                .cache
+                .borrow()
+                .external_order_claim(&instrument_id),
+            None
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

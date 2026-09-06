@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
@@ -13,17 +12,18 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+"""
+Request REST data and stream Unusual Whales custom data.
+"""
 
 from nautilus_trader.adapters.unusual_whales import UNUSUAL_WHALES
 from nautilus_trader.adapters.unusual_whales import UnusualWhalesDataClientConfig
 from nautilus_trader.adapters.unusual_whales import UnusualWhalesDataClientFactory
 from nautilus_trader.common import Environment
-from nautilus_trader.config import StrategyConfig
-from nautilus_trader.core import Data
 from nautilus_trader.live import LiveNode
 from nautilus_trader.live import RoutingConfig
-from nautilus_trader.model import DataType
 from nautilus_trader.model import ClientId
+from nautilus_trader.model import DataType
 from nautilus_trader.model import TraderId
 from nautilus_trader.trading import Strategy
 
@@ -35,32 +35,51 @@ WEBSOCKET_CHANNEL = "price:AAPL"
 CLIENT_ID = ClientId.from_str(UNUSUAL_WHALES)
 
 
-class UnusualWhalesTesterConfig(StrategyConfig, frozen=True):
-    rest_operation: str
-    websocket_channel: str
-
-
 class UnusualWhalesTester(Strategy):
+    """
+    Log the requested REST response and subscribed WebSocket events.
+    """
+
+    def __init__(self, rest_operation: str, websocket_channel: str) -> None:
+        """
+        Set the REST operation and WebSocket channel.
+        """
+        super().__init__()
+        self._rest_operation = rest_operation
+        self._websocket_channel = websocket_channel
+
     def on_start(self) -> None:
+        """
+        Request REST data and subscribe to the configured channel.
+        """
         rest_type = DataType(
             "UnusualWhalesRestResult",
-            metadata={"operation_id": self.config.rest_operation},
+            metadata={"operation_id": self._rest_operation},
         )
         stream_type = DataType(
             "UnusualWhalesWebSocketEvent",
-            metadata={"channel": self.config.websocket_channel},
+            metadata={"channel": self._websocket_channel},
         )
         self.request_data(rest_type, CLIENT_ID)
         self.subscribe_data(stream_type, CLIENT_ID)
 
-    def on_data(self, data: Data) -> None:
+    def on_data(self, data: object) -> None:
+        """
+        Log a custom data event.
+        """
         self.log.info(repr(data))
 
-    def on_historical_data(self, data: Data) -> None:
+    def on_historical_data(self, data: object) -> None:
+        """
+        Log a historical custom data response.
+        """
         self.log.info(repr(data))
 
 
 def main() -> None:
+    """
+    Run the Unusual Whales data example.
+    """
     node = (
         LiveNode.builder("UNUSUAL-WHALES-DATA-TESTER-001", TRADER_ID, Environment.LIVE)
         .add_data_client(
@@ -73,11 +92,9 @@ def main() -> None:
     )
     node.add_strategy(
         UnusualWhalesTester(
-            UnusualWhalesTesterConfig(
-                rest_operation=REST_OPERATION,
-                websocket_channel=WEBSOCKET_CHANNEL,
-            )
-        )
+            rest_operation=REST_OPERATION,
+            websocket_channel=WEBSOCKET_CHANNEL,
+        ),
     )
     try:
         node.run()

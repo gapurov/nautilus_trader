@@ -1,6 +1,5 @@
 [package]
 name = "nautilus-unusual-whales"
-readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -50,7 +49,9 @@ high-precision = [
 ]
 
 [package.metadata.cargo-machete]
-ignored = ["nautilus-live"] # Used only to propagate the optional examples and extension features
+ignored = [
+  "nautilus-live",
+] # Used only to propagate the optional examples and extension features
 
 [package.metadata.docs.rs]
 # Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
